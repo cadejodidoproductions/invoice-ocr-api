@@ -39,13 +39,13 @@ uvicorn working_pdf_extractor:app --reload --port 8001
 # Process a PDF invoice
 curl -X POST -F "file=@invoice.pdf" https://your-app.onrender.com/invoice-to-json
 
-# Response
+# Example Response
 {
-  "vendor": "Wix.com LTD",
-  "invoice_no": "1044495965",
-  "date": "Mar 8, 2023",
-  "total": 828.0,
-  "all_amounts": [828.0, 414.0, 414.0, 414.0],
+  "vendor": "ACME Corporation",
+  "invoice_no": "INV-2024-001",
+  "date": "Jan 15, 2024",
+  "total": 1250.00,
+  "all_amounts": [1250.00, 500.00, 500.00, 250.00],
   "file_type": "PDF"
 }
 ```
