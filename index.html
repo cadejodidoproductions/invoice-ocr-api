@@ -36,11 +36,14 @@
             position: relative;
         }
         .cdp-logo {
-            width: 180px;
-            height: auto;
+            width: 150px;
+            height: 150px;
             margin: 0 auto 30px;
             display: block;
-            filter: brightness(0) invert(1);
+            background: white;
+            border-radius: 50%;
+            padding: 10px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
         }
         h1 {
             font-size: 3em;
@@ -163,7 +166,8 @@
                 font-size: 3em;
             }
             .cdp-logo {
-                width: 140px;
+                width: 120px;
+                height: 120px;
             }
         }
     </style>
@@ -171,11 +175,10 @@
 <body>
     <div class="container">
         <div class="header">
-            <!-- CDP Logo - Replace src with actual logo URL -->
-            <img src="https://raw.githubusercontent.com/cadejodidoproductions/assets/main/cdp-logo.png" 
+            <!-- CDP Logo -->
+            <img src="https://static.wixstatic.com/media/333724_2a1558e410794b0caba6b7c014731a05~mv2.png/v1/fill/w_174,h_174,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/333724_2a1558e410794b0caba6b7c014731a05~mv2.png" 
                  alt="Cadejo Dido Productions" 
-                 class="cdp-logo"
-                 onerror="this.style.display='none'">
+                 class="cdp-logo">
             <h1>Invoice OCR API</h1>
             <p class="tagline">Stop Manual Data Entry Forever</p>
         </div>
@@ -234,7 +237,7 @@
             </div>
         </div>
 
-        <div class="terms-section">
+        <div class="terms-section" id="terms">
             <h2>Terms of Service</h2>
             <p><em>Last updated: July 25, 2025</em></p>
             
@@ -292,7 +295,7 @@
             <p>© 2025 Invoice OCR API • A <strong>Cadejo Dido Productions</strong> Product</p>
             <p style="margin-top: 10px;">
                 <a href="https://github.com/cadejodidoproductions/invoice-ocr-api" style="color: #5469d4;">View on GitHub</a> • 
-                <a href="#terms" onclick="document.querySelector('.terms-section').scrollIntoView({behavior: 'smooth'}); return false;" style="color: #5469d4;">Terms of Service</a> • 
+                <a href="#terms" style="color: #5469d4;">Terms of Service</a> • 
                 <a href="mailto:support@invoiceocrapi.com" style="color: #5469d4;">Contact Support</a>
             </p>
         </div>
