@@ -1,51 +1,41 @@
-<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-  <!-- Background Circle -->
-  <circle cx="100" cy="100" r="90" fill="#5469d4" opacity="0.1"/>
-  
-  <!-- Document Icon -->
-  <g transform="translate(50, 40)">
-    <!-- Document Background -->
-    <rect x="10" y="10" width="80" height="100" rx="4" fill="#ffffff" stroke="#5469d4" stroke-width="2"/>
-    
-    <!-- Document Corner Fold -->
-    <path d="M 70 10 L 90 30 L 90 10 Z" fill="#e8eaff" stroke="#5469d4" stroke-width="2"/>
-    
-    <!-- Text Lines (representing invoice content) -->
-    <rect x="20" y="25" width="50" height="3" rx="1.5" fill="#5469d4" opacity="0.6"/>
-    <rect x="20" y="35" width="40" height="3" rx="1.5" fill="#5469d4" opacity="0.6"/>
-    <rect x="20" y="45" width="45" height="3" rx="1.5" fill="#5469d4" opacity="0.6"/>
-    
-    <!-- Dollar Sign for Invoice -->
-    <circle cx="50" cy="70" r="15" fill="#5469d4" opacity="0.2"/>
-    <text x="50" y="77" font-family="Arial, sans-serif" font-size="20" font-weight="bold" text-anchor="middle" fill="#5469d4">$</text>
-    
-    <!-- Data Points -->
-    <circle cx="25" cy="90" r="2" fill="#5469d4"/>
-    <circle cx="35" cy="90" r="2" fill="#5469d4"/>
-    <circle cx="45" cy="90" r="2" fill="#5469d4"/>
-  </g>
-  
-  <!-- OCR Scanner Effect -->
-  <g transform="translate(100, 100)">
-    <!-- Scanner Brackets -->
-    <path d="M -20 -30 L -30 -30 L -30 -20" fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="round"/>
-    <path d="M 20 -30 L 30 -30 L 30 -20" fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="round"/>
-    <path d="M -20 30 L -30 30 L -30 20" fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="round"/>
-    <path d="M 20 30 L 30 30 L 30 20" fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="round"/>
-    
-    <!-- Scan Line -->
-    <rect x="-25" y="-2" width="50" height="4" fill="url(#scanGradient)" opacity="0.8"/>
-  </g>
-  
-  <!-- API Text -->
-  <text x="100" y="170" font-family="Arial, sans-serif" font-size="18" font-weight="bold" text-anchor="middle" fill="#333">OCR API</text>
-  
-  <!-- Gradient Definition -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
   <defs>
-    <linearGradient id="scanGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:#22c55e;stop-opacity:0" />
-      <stop offset="50%" style="stop-color:#22c55e;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#22c55e;stop-opacity:0" />
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
     </linearGradient>
   </defs>
+  
+  <!-- Background circle -->
+  <circle cx="100" cy="100" r="90" fill="url(#grad1)" />
+  
+  <!-- Document icon -->
+  <g transform="translate(50, 40)">
+    <!-- Document outline -->
+    <path d="M 20 10 L 20 110 L 80 110 L 80 30 L 60 10 Z" 
+          fill="white" 
+          stroke="none"/>
+    
+    <!-- Document fold -->
+    <path d="M 60 10 L 60 30 L 80 30 Z" 
+          fill="#e0e0e0" 
+          stroke="none"/>
+    
+    <!-- OCR scan lines -->
+    <rect x="30" y="45" width="40" height="3" fill="#667eea" opacity="0.8"/>
+    <rect x="30" y="55" width="40" height="3" fill="#667eea" opacity="0.8"/>
+    <rect x="30" y="65" width="30" height="3" fill="#667eea" opacity="0.8"/>
+    <rect x="30" y="75" width="35" height="3" fill="#667eea" opacity="0.8"/>
+    <rect x="30" y="85" width="25" height="3" fill="#667eea" opacity="0.8"/>
+    
+    <!-- Scanning effect -->
+    <rect x="25" y="40" width="50" height="2" fill="#00ff00" opacity="0.6">
+      <animate attributeName="y" values="40;95;40" dur="3s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.6;0.8;0.6" dur="3s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+  
+  <!-- Text "OCR" -->
+  <text x="100" y="165" font-family="Arial, sans-serif" font-size="24" font-weight="bold" 
+        fill="white" text-anchor="middle">OCR API</text>
 </svg>
