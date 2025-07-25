@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Thank You - Invoice OCR API</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 600px;
+            margin: 100px auto;
+            padding: 20px;
+            text-align: center;
+        }
+        .success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+            padding: 20px;
+            border-radius: 5px;
+            margin-bottom: 30px;
+        }
+        .api-key {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: monospace;
+            margin: 20px 0;
+        }
+        code {
+            background: #e9ecef;
+            padding: 10px;
+            display: block;
+            margin: 10px 0;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="success">
+        <h1>🎉 Welcome to Invoice OCR API!</h1>
+        <p>Your subscription is active. Here's how to get started:</p>
+    </div>
+
+    <h2>Quick Start:</h2>
+    <div class="api-key">
+        API Endpoint: https://invoice-ocr-api.onrender.com/invoice-to-json
+    </div>
+
+    <h3>Test it now:</h3>
+    <code>curl -X POST -F "file=@invoice.pdf" https://invoice-ocr-api.onrender.com/invoice-to-json</code>
+
+    <h3>What's next?</h3>
+    <ul style="text-align: left; display: inline-block;">
+        <li>📧 Check your email for API documentation</li>
+        <li>💬 Join our Slack community for support</li>
+        <li>📊 Process unlimited invoices</li>
+    </ul>
+
+    <p style="margin-top: 40px;">
+        <a href="mailto:support@invoiceocrapi.com">Need help? Contact support</a>
+    </p>
+</body>
+</html>
