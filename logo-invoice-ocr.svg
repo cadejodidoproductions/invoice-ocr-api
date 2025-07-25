@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background Circle -->
+  <circle cx="100" cy="100" r="95" fill="#5469d4" opacity="0.1"/>
+  
+  <!-- Invoice Icon Base -->
+  <g transform="translate(100, 100)">
+    <!-- Document Shape -->
+    <rect x="-40" y="-50" width="80" height="100" rx="4" fill="#ffffff" stroke="#5469d4" stroke-width="3"/>
+    
+    <!-- Document Lines (representing text extraction) -->
+    <rect x="-30" y="-35" width="40" height="3" fill="#5469d4" opacity="0.8"/>
+    <rect x="-30" y="-25" width="50" height="3" fill="#5469d4" opacity="0.7"/>
+    <rect x="-30" y="-15" width="45" height="3" fill="#5469d4" opacity="0.6"/>
+    <rect x="-30" y="-5" width="35" height="3" fill="#5469d4" opacity="0.5"/>
+    
+    <!-- Dollar Sign (representing total extraction) -->
+    <text x="0" y="25" font-family="Arial, sans-serif" font-size="24" font-weight="bold" text-anchor="middle" fill="#4CAF50">$</text>
+    
+    <!-- OCR Scanner Lines -->
+    <rect x="-45" y="-20" width="5" height="40" fill="#FF6B6B" opacity="0.6">
+      <animate attributeName="x" from="-45" to="40" dur="3s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.6;0.3;0.6" dur="3s" repeatCount="indefinite"/>
+    </rect>
+    
+    <!-- Corner Brackets (scanning focus) -->
+    <path d="M -40,-50 L -40,-40 L -30,-50" fill="none" stroke="#FF6B6B" stroke-width="2"/>
+    <path d="M 40,-50 L 40,-40 L 30,-50" fill="none" stroke="#FF6B6B" stroke-width="2"/>
+    <path d="M -40,50 L -40,40 L -30,50" fill="none" stroke="#FF6B6B" stroke-width="2"/>
+    <path d="M 40,50 L 40,40 L 30,50" fill="none" stroke="#FF6B6B" stroke-width="2"/>
+  </g>
+  
+  <!-- Microservice Badge -->
+  <g transform="translate(140, 140)">
+    <circle cx="0" cy="0" r="25" fill="#FF6B6B"/>
+    <text x="0" y="5" font-family="Arial, sans-serif" font-size="12" font-weight="bold" text-anchor="middle" fill="white">OCR</text>
+  </g>
+  
+  <!-- API Label -->
+  <text x="100" y="190" font-family="Arial, sans-serif" font-size="14" font-weight="bold" text-anchor="middle" fill="#5469d4">Invoice API</text>
+</svg>
