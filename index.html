@@ -33,12 +33,14 @@
             color: white;
             border-radius: 10px;
             margin-bottom: 40px;
+            position: relative;
         }
-        .logo {
-            width: 120px;
-            height: 120px;
-            margin: 0 auto 20px;
+        .cdp-logo {
+            width: 180px;
+            height: auto;
+            margin: 0 auto 30px;
             display: block;
+            filter: brightness(0) invert(1);
         }
         h1 {
             font-size: 3em;
@@ -99,6 +101,7 @@
             display: block;
             overflow-x: auto;
             margin-bottom: 20px;
+            font-family: 'Courier New', monospace;
         }
         .demo pre {
             background: #1a202c;
@@ -136,6 +139,22 @@
             padding: 40px 0;
             color: #666;
         }
+        .terms-section {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 40px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .terms-section h2 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .terms-section h3 {
+            color: #5469d4;
+            margin-top: 20px;
+            margin-bottom: 10px;
+        }
         @media (max-width: 768px) {
             h1 {
                 font-size: 2em;
@@ -143,12 +162,20 @@
             .price {
                 font-size: 3em;
             }
+            .cdp-logo {
+                width: 140px;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
+            <!-- CDP Logo - Replace src with actual logo URL -->
+            <img src="https://raw.githubusercontent.com/cadejodidoproductions/assets/main/cdp-logo.png" 
+                 alt="Cadejo Dido Productions" 
+                 class="cdp-logo"
+                 onerror="this.style.display='none'">
             <h1>Invoice OCR API</h1>
             <p class="tagline">Stop Manual Data Entry Forever</p>
         </div>
@@ -207,6 +234,54 @@
             </div>
         </div>
 
+        <div class="terms-section">
+            <h2>Terms of Service</h2>
+            <p><em>Last updated: July 25, 2025</em></p>
+            
+            <h3>1. Acceptance of Terms</h3>
+            <p>By accessing and using the Invoice OCR API service ("Service") provided by Cadejo Dido Productions LLC ("we," "us," or "our"), you agree to be bound by these Terms of Service.</p>
+            
+            <h3>2. Service Description</h3>
+            <p>The Invoice OCR API extracts data from PDF invoices. We provide the service "as is" and make no guarantees about accuracy, though we strive for 99.9% accuracy.</p>
+            
+            <h3>3. Privacy & Data Security</h3>
+            <p>• We process your invoices in memory only<br>
+            • No permanent storage of your documents<br>
+            • All data transmission is encrypted via HTTPS<br>
+            • We never share your data with third parties</p>
+            
+            <h3>4. Acceptable Use</h3>
+            <p>You agree not to:<br>
+            • Use the service for illegal purposes<br>
+            • Attempt to reverse engineer the API<br>
+            • Exceed reasonable usage limits<br>
+            • Process documents you don't have rights to</p>
+            
+            <h3>5. Payment Terms</h3>
+            <p>• Subscription: $99/month<br>
+            • Billed monthly via Stripe<br>
+            • Cancel anytime, effective at end of billing period<br>
+            • No refunds for partial months</p>
+            
+            <h3>6. Service Level Agreement</h3>
+            <p>• 99.9% uptime target<br>
+            • API rate limit: 100 requests/minute<br>
+            • Max file size: 10MB per invoice<br>
+            • Support response time: 24-48 hours</p>
+            
+            <h3>7. Limitation of Liability</h3>
+            <p>Our liability is limited to the amount you paid in the last month. We're not responsible for indirect damages, lost profits, or data accuracy issues.</p>
+            
+            <h3>8. Termination</h3>
+            <p>Either party may terminate with notice. We reserve the right to terminate immediately for Terms violations.</p>
+            
+            <h3>9. Changes to Terms</h3>
+            <p>We may update these terms with 30 days notice via email.</p>
+            
+            <h3>10. Contact</h3>
+            <p>Questions? Email us at <a href="mailto:support@invoiceocrapi.com">support@invoiceocrapi.com</a></p>
+        </div>
+
         <div style="text-align: center; margin: 40px 0;">
             <a href="https://buy.stripe.com/3cI6oG2OEe1e4Cfh1RabK01" class="cta-button">
                 Get Started Now →
@@ -214,24 +289,13 @@
         </div>
 
         <div class="footer">
-            <p>© 2025 Invoice OCR API • Built with ❤️ by Cadejo Dido Productions</p>
+            <p>© 2025 Invoice OCR API • A <strong>Cadejo Dido Productions</strong> Product</p>
             <p style="margin-top: 10px;">
                 <a href="https://github.com/cadejodidoproductions/invoice-ocr-api" style="color: #5469d4;">View on GitHub</a> • 
+                <a href="#terms" onclick="document.querySelector('.terms-section').scrollIntoView({behavior: 'smooth'}); return false;" style="color: #5469d4;">Terms of Service</a> • 
                 <a href="mailto:support@invoiceocrapi.com" style="color: #5469d4;">Contact Support</a>
             </p>
         </div>
     </div>
-
-    <script>
-        // Force refresh to bypass GitHub Pages cache
-        if (window.location.hostname === 'cadejodidoproductions.github.io') {
-            const metaRefresh = document.createElement('meta');
-            metaRefresh.httpEquiv = 'refresh';
-            metaRefresh.content = '0';
-            if (!window.location.search.includes('refreshed=1')) {
-                window.location.search = '?refreshed=1&t=' + Date.now();
-            }
-        }
-    </script>
 </body>
 </html>
