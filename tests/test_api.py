@@ -1,5 +1,5 @@
 """
-Tests for Invoice OCR API endpoints (v2.3.0).
+Tests for Invoice OCR API endpoints (v2.4.0).
 """
 
 import io
@@ -17,7 +17,7 @@ class TestHealthEndpoints:
         data = response.json()
         assert data["status"] == "healthy"
         assert data["service"] == "Invoice OCR API"
-        assert data["version"] == "2.3.0"
+        assert data["version"] == "2.4.0"
 
     def test_health_endpoint(self, client):
         """Test the detailed health endpoint."""
@@ -317,3 +317,88 @@ class TestImageFormats:
         files = {"file": ("invoice.jpg", io.BytesIO(sample_jpg_content), "image/jpeg")}
         response = client.post("/invoice-to-json", headers=auth_headers, files=files)
         assert response.status_code in [200, 400, 422]
+
+
+class TestOcrLanguages:
+    """Tests for multi-language OCR support."""
+
+    def test_list_ocr_languages(self, client):
+        """Test listing supported OCR languages."""
+        response = client.get("/ocr/languages")
+        assert response.status_code == 200
+        data = response.json()
+        assert "languages" in data
+        assert "default_language" in data
+
+    def test_v1_list_ocr_languages(self, client):
+        """Test v1 API for listing OCR languages."""
+        response = client.get("/v1/ocr/languages")
+        assert response.status_code == 200
+        data = response.json()
+        assert "languages" in data
+
+    def test_ocr_lang_parameter_accepted(self, client, auth_headers, sample_pdf_content):
+        """Test that ocr_lang parameter is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"ocr_lang": "eng"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        assert response.status_code in [200, 422]
+
+    def test_invalid_ocr_lang_rejected(self, client, auth_headers, sample_pdf_content):
+        """Test that invalid OCR language is rejected."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"ocr_lang": "invalid_lang_xyz"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        assert response.status_code == 400
+        assert "Unsupported OCR language" in response.json()["detail"]
+
+    def test_spanish_language_accepted(self, client, auth_headers, sample_pdf_content):
+        """Test that Spanish language code is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"ocr_lang": "spa"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        assert response.status_code in [200, 422]
+
+    def test_french_language_accepted(self, client, auth_headers, sample_pdf_content):
+        """Test that French language code is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"ocr_lang": "fra"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        assert response.status_code in [200, 422]
+
+    def test_german_language_accepted(self, client, auth_headers, sample_pdf_content):
+        """Test that German language code is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"ocr_lang": "deu"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        assert response.status_code in [200, 422]
+
+    def test_japanese_language_accepted(self, client, auth_headers, sample_pdf_content):
+        """Test that Japanese language code is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"ocr_lang": "jpn"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        assert response.status_code in [200, 422]
+
+    def test_chinese_language_accepted(self, client, auth_headers, sample_pdf_content):
+        """Test that Chinese language code is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"ocr_lang": "zho"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        assert response.status_code in [200, 422]
+
+    def test_async_ocr_lang_parameter(self, client, auth_headers, sample_pdf_content):
+        """Test that async endpoint accepts ocr_lang parameter."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"ocr_lang": "spa"}
+        response = client.post("/invoice-to-json/async", headers=auth_headers, files=files, data=data)
+        assert response.status_code == 200
+        assert "job_id" in response.json()
+
+    def test_batch_ocr_lang_parameter(self, client, auth_headers, sample_pdf_content):
+        """Test that batch endpoint accepts ocr_lang parameter."""
+        files = [
+            ("files", ("invoice1.pdf", io.BytesIO(sample_pdf_content), "application/pdf")),
+        ]
+        response = client.post("/invoice-to-json/batch", headers=auth_headers, files=files, data={"ocr_lang": "fra"})
+        assert response.status_code == 200

@@ -1,6 +1,6 @@
 """
 Invoice OCR API - PDF Data Extraction Service
-Version 2.3.0 - OCR support, image formats, validation, async job queue.
+Version 2.4.0 - Multi-language OCR support.
 """
 
 import asyncio
@@ -70,9 +70,55 @@ MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "10"))
 WEBHOOK_TIMEOUT = int(os.getenv("WEBHOOK_TIMEOUT", "10"))
 JSON_LOGGING = os.getenv("JSON_LOGGING", "false").lower() == "true"
 OCR_ENABLED = os.getenv("OCR_ENABLED", "true").lower() == "true" and OCR_AVAILABLE
-OCR_LANGUAGE = os.getenv("OCR_LANGUAGE", "eng")
+OCR_DEFAULT_LANGUAGE = os.getenv("OCR_LANGUAGE", "eng")
 OCR_DPI = int(os.getenv("OCR_DPI", "300"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# Supported OCR languages (Tesseract language codes)
+# Install additional languages: apt-get install tesseract-ocr-<lang>
+OCR_SUPPORTED_LANGUAGES = {
+    "eng": "English",
+    "spa": "Spanish",
+    "fra": "French",
+    "deu": "German",
+    "ita": "Italian",
+    "por": "Portuguese",
+    "nld": "Dutch",
+    "pol": "Polish",
+    "rus": "Russian",
+    "ukr": "Ukrainian",
+    "ara": "Arabic",
+    "hin": "Hindi",
+    "ben": "Bengali",
+    "zho": "Chinese (Simplified)",
+    "chi_tra": "Chinese (Traditional)",
+    "jpn": "Japanese",
+    "kor": "Korean",
+    "tha": "Thai",
+    "vie": "Vietnamese",
+    "tur": "Turkish",
+    "heb": "Hebrew",
+    "ell": "Greek",
+    "ces": "Czech",
+    "dan": "Danish",
+    "fin": "Finnish",
+    "hun": "Hungarian",
+    "nor": "Norwegian",
+    "swe": "Swedish",
+    "ron": "Romanian",
+    "ind": "Indonesian",
+    "msa": "Malay",
+}
+
+def get_ocr_languages() -> list[str]:
+    """Get list of available OCR languages on this system."""
+    if not OCR_AVAILABLE:
+        return []
+    try:
+        available = pytesseract.get_languages()
+        return [lang for lang in available if lang in OCR_SUPPORTED_LANGUAGES or lang == "osd"]
+    except Exception:
+        return list(OCR_SUPPORTED_LANGUAGES.keys())
 CELERY_ENABLED = os.getenv("CELERY_ENABLED", "false").lower() == "true" and CELERY_AVAILABLE
 
 # =============================================================================
@@ -695,15 +741,16 @@ def ocr_pdf_pages(content: bytes, dpi: int = 300, language: str = "eng") -> str:
     return "\n\n".join(texts)
 
 
-def process_image_file(content: bytes, filename: str, log: RequestIdAdapter) -> str:
+def process_image_file(content: bytes, filename: str, log: RequestIdAdapter, language: str = None) -> str:
     """Process an image file and extract text using OCR."""
     if not OCR_AVAILABLE:
         raise ValueError("OCR not available. Install pytesseract and Pillow.")
 
+    lang = language or OCR_DEFAULT_LANGUAGE
     image = Image.open(io.BytesIO(content))
-    log.info(f"Processing image: {filename}, size={image.size}, mode={image.mode}")
+    log.info(f"Processing image: {filename}, size={image.size}, mode={image.mode}, lang={lang}")
 
-    text = ocr_image(image, OCR_LANGUAGE)
+    text = ocr_image(image, lang)
     return text
 
 
@@ -712,14 +759,20 @@ def process_image_file(content: bytes, filename: str, log: RequestIdAdapter) -> 
 # =============================================================================
 
 
-def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True) -> dict:
+def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True, ocr_language: str = None) -> dict:
     """Process a document (PDF or image) and extract invoice data."""
     valid, file_type, error = validate_file(content, filename)
     if not valid:
         raise ValueError(error)
 
+    lang = ocr_language or OCR_DEFAULT_LANGUAGE
+    # Validate language
+    if lang not in OCR_SUPPORTED_LANGUAGES and lang != "osd":
+        raise ValueError(f"Unsupported OCR language: {lang}. Supported: {', '.join(OCR_SUPPORTED_LANGUAGES.keys())}")
+
     text = ""
     ocr_used = False
+    ocr_lang_used = None
     pages = 1
 
     if file_type == "pdf":
@@ -737,9 +790,10 @@ def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, 
 
         # If no text extracted and OCR is enabled, use OCR
         if not text.strip() and use_ocr and OCR_ENABLED:
-            log.info("No text in PDF, attempting OCR")
-            text = ocr_pdf_pages(content, OCR_DPI, OCR_LANGUAGE)
+            log.info(f"No text in PDF, attempting OCR with language: {lang}")
+            text = ocr_pdf_pages(content, OCR_DPI, lang)
             ocr_used = True
+            ocr_lang_used = lang
             metrics.inc("ocr")
 
     elif file_type in {"png", "jpg", "tiff"}:
@@ -747,8 +801,9 @@ def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, 
         if not OCR_ENABLED:
             raise ValueError("Image processing requires OCR to be enabled")
 
-        text = process_image_file(content, filename, log)
+        text = process_image_file(content, filename, log, lang)
         ocr_used = True
+        ocr_lang_used = lang
         metrics.inc("ocr")
 
     if not text.strip():
@@ -759,6 +814,7 @@ def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, 
     result["pages"] = pages
     result["filename"] = filename
     result["ocr_used"] = ocr_used
+    result["ocr_language"] = ocr_lang_used
 
     # Add validation
     validation = validate_invoice_data(result)
@@ -770,12 +826,12 @@ def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, 
     return result
 
 
-async def process_document(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True) -> dict:
+async def process_document(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True, ocr_language: str = None) -> dict:
     """Async wrapper for document processing."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None,
-        lambda: process_document_sync(content, filename, log, password, use_ocr)
+        lambda: process_document_sync(content, filename, log, password, use_ocr, ocr_language)
     )
 
 
@@ -785,7 +841,7 @@ async def process_document(content: bytes, filename: str, log: RequestIdAdapter,
 
 if CELERY_ENABLED:
     @celery_app.task(bind=True)
-    def process_document_task(self, content_b64: str, filename: str, password: Optional[str] = None, use_ocr: bool = True, webhook_url: Optional[str] = None):
+    def process_document_task(self, content_b64: str, filename: str, password: Optional[str] = None, use_ocr: bool = True, webhook_url: Optional[str] = None, ocr_language: str = None):
         """Celery task for async document processing."""
         import base64
 
@@ -794,7 +850,7 @@ if CELERY_ENABLED:
 
         try:
             job_store.update(self.request.id, "processing")
-            result = process_document_sync(content, filename, log, password, use_ocr)
+            result = process_document_sync(content, filename, log, password, use_ocr, ocr_language)
             job_store.update(self.request.id, "completed", result=result)
 
             # Send webhook if configured
@@ -924,12 +980,13 @@ async def process_invoice(
     password: Optional[str] = Form(None),
     webhook_url: Optional[str] = Form(None),
     use_ocr: Optional[bool] = Form(True),
+    ocr_lang: Optional[str] = Form(None, description="OCR language code (e.g., eng, spa, fra, deu, jpn, zho)"),
     validate: Optional[bool] = Form(True),
     export: Optional[str] = Query(None, pattern="^(json|csv|xml)$"),
     _a: bool = Depends(auth),
     _r: bool = Depends(rate_limit),
 ):
-    """Extract data from invoice document (PDF, PNG, JPG, TIFF). Supports OCR for scanned documents."""
+    """Extract data from invoice document (PDF, PNG, JPG, TIFF). Supports OCR for scanned documents in 30+ languages."""
     t0 = time.time()
     log = get_log(request)
     metrics.inc("requests")
@@ -949,6 +1006,11 @@ async def process_invoice(
     if not valid:
         raise HTTPException(400, error)
 
+    # Validate OCR language if provided
+    lang = ocr_lang or OCR_DEFAULT_LANGUAGE
+    if lang not in OCR_SUPPORTED_LANGUAGES and lang != "osd":
+        raise HTTPException(400, f"Unsupported OCR language: {lang}. Supported: {', '.join(sorted(OCR_SUPPORTED_LANGUAGES.keys()))}")
+
     cached = response_cache.get(content) if not password else None
     if cached:
         metrics.inc("cache_hit")
@@ -960,7 +1022,7 @@ async def process_invoice(
     metrics.inc("cache_miss")
     try:
         result = await asyncio.wait_for(
-            process_document(content, fn, log, password, use_ocr and OCR_ENABLED),
+            process_document(content, fn, log, password, use_ocr and OCR_ENABLED, lang),
             REQUEST_TIMEOUT
         )
     except asyncio.TimeoutError:
@@ -989,10 +1051,11 @@ async def process_invoice_async(
     password: Optional[str] = Form(None),
     webhook_url: Optional[str] = Form(None),
     use_ocr: Optional[bool] = Form(True),
+    ocr_lang: Optional[str] = Form(None, description="OCR language code (e.g., eng, spa, fra, deu, jpn, zho)"),
     _a: bool = Depends(auth),
     _r: bool = Depends(rate_limit),
 ):
-    """Submit invoice for async processing. Returns job ID for status polling."""
+    """Submit invoice for async processing. Returns job ID for status polling. Supports 30+ OCR languages."""
     log = get_log(request)
     metrics.inc("requests")
     metrics.inc("async_job")
@@ -1011,6 +1074,11 @@ async def process_invoice_async(
     if not valid:
         raise HTTPException(400, error)
 
+    # Validate OCR language
+    lang = ocr_lang or OCR_DEFAULT_LANGUAGE
+    if lang not in OCR_SUPPORTED_LANGUAGES and lang != "osd":
+        raise HTTPException(400, f"Unsupported OCR language: {lang}. Supported: {', '.join(sorted(OCR_SUPPORTED_LANGUAGES.keys()))}")
+
     job_id = str(uuid.uuid4())
 
     if CELERY_ENABLED:
@@ -1018,7 +1086,7 @@ async def process_invoice_async(
         import base64
         content_b64 = base64.b64encode(content).decode()
         task = process_document_task.apply_async(
-            args=[content_b64, fn, password, use_ocr and OCR_ENABLED, webhook_url],
+            args=[content_b64, fn, password, use_ocr and OCR_ENABLED, webhook_url, lang],
             task_id=job_id,
         )
         job_store.create(job_id)
@@ -1029,7 +1097,7 @@ async def process_invoice_async(
         async def process_bg():
             try:
                 job_store.update(job_id, "processing")
-                result = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED)
+                result = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED, lang)
                 job_store.update(job_id, "completed", result=result)
                 metrics.inc("success")
 
@@ -1076,8 +1144,8 @@ def _resp(data: dict, fmt: Optional[str], request: Request, cached: bool) -> Res
 
 
 @app.post("/invoice-to-json/batch")
-async def batch(request: Request, files: list[UploadFile] = File(...), password: Optional[str] = Form(None), use_ocr: Optional[bool] = Form(True), _a: bool = Depends(auth), _r: bool = Depends(rate_limit)):
-    """Process multiple documents in one request."""
+async def batch(request: Request, files: list[UploadFile] = File(...), password: Optional[str] = Form(None), use_ocr: Optional[bool] = Form(True), ocr_lang: Optional[str] = Form(None), _a: bool = Depends(auth), _r: bool = Depends(rate_limit)):
+    """Process multiple documents in one request. Supports 30+ OCR languages."""
     t0 = time.time()
     log = get_log(request)
     metrics.inc("requests")
@@ -1086,6 +1154,11 @@ async def batch(request: Request, files: list[UploadFile] = File(...), password:
         raise HTTPException(400, f"Max {MAX_BATCH_SIZE} files")
     if not files:
         raise HTTPException(400, "No files")
+
+    # Validate OCR language
+    lang = ocr_lang or OCR_DEFAULT_LANGUAGE
+    if lang not in OCR_SUPPORTED_LANGUAGES and lang != "osd":
+        raise HTTPException(400, f"Unsupported OCR language: {lang}. Supported: {', '.join(sorted(OCR_SUPPORTED_LANGUAGES.keys()))}")
 
     results = []
     for f in files:
@@ -1106,7 +1179,7 @@ async def batch(request: Request, files: list[UploadFile] = File(...), password:
                 results.append({"filename": fn, "success": True, "cached": True, "data": cached})
                 continue
 
-            data = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED)
+            data = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED, lang)
             if not password:
                 response_cache.set(content, data)
             results.append({"filename": fn, "success": True, "cached": False, "data": data})
@@ -1125,13 +1198,13 @@ async def batch(request: Request, files: list[UploadFile] = File(...), password:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "Invoice OCR API", "version": "2.3.0"}
+    return {"status": "healthy", "service": "Invoice OCR API", "version": "2.4.0"}
 
 
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy", "version": "2.3.0",
+        "status": "healthy", "version": "2.4.0",
         "features": {
             "auth": API_KEY is not None,
             "rate_limiting": True,
@@ -1143,6 +1216,7 @@ async def health():
             "webhooks": True,
             "pdf_password": True,
             "ocr": OCR_ENABLED,
+            "ocr_languages": len(OCR_SUPPORTED_LANGUAGES) if OCR_ENABLED else 0,
             "image_formats": ["png", "jpg", "tiff"] if OCR_ENABLED else [],
             "async_processing": True,
             "celery": CELERY_ENABLED,
@@ -1153,9 +1227,27 @@ async def health():
             "rate_limit": f"{RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s",
             "timeout": REQUEST_TIMEOUT,
             "batch_size": MAX_BATCH_SIZE,
-            "ocr_language": OCR_LANGUAGE if OCR_ENABLED else None,
+            "ocr_default_language": OCR_DEFAULT_LANGUAGE if OCR_ENABLED else None,
             "ocr_dpi": OCR_DPI if OCR_ENABLED else None,
         }
+    }
+
+
+@app.get("/ocr/languages")
+async def list_ocr_languages():
+    """List all supported OCR languages."""
+    if not OCR_ENABLED:
+        return {"available": False, "message": "OCR is not enabled", "languages": []}
+
+    return {
+        "available": True,
+        "default_language": OCR_DEFAULT_LANGUAGE,
+        "supported_count": len(OCR_SUPPORTED_LANGUAGES),
+        "languages": [
+            {"code": code, "name": name}
+            for code, name in sorted(OCR_SUPPORTED_LANGUAGES.items(), key=lambda x: x[1])
+        ],
+        "note": "To use a language, ensure the corresponding Tesseract language pack is installed (e.g., apt-get install tesseract-ocr-spa for Spanish)"
     }
 
 
@@ -1176,6 +1268,7 @@ v1.add_api_route("/invoice-to-json/batch", batch, methods=["POST"])
 v1.add_api_route("/jobs/{job_id}", get_job_status, methods=["GET"])
 v1.add_api_route("/health", health, methods=["GET"])
 v1.add_api_route("/metrics", metrics_json, methods=["GET"])
+v1.add_api_route("/ocr/languages", list_ocr_languages, methods=["GET"])
 app.include_router(v1)
 
 if __name__ == "__main__":
