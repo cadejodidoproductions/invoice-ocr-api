@@ -1,5 +1,5 @@
 """
-Tests for Invoice OCR API endpoints.
+Tests for Invoice OCR API endpoints (v2.2.0).
 """
 
 import io
@@ -17,7 +17,7 @@ class TestHealthEndpoints:
         data = response.json()
         assert data["status"] == "healthy"
         assert data["service"] == "Invoice OCR API"
-        assert "version" in data
+        assert data["version"] == "2.2.0"
 
     def test_health_endpoint(self, client):
         """Test the detailed health endpoint."""
@@ -27,11 +27,28 @@ class TestHealthEndpoints:
         assert data["status"] == "healthy"
         assert "features" in data
         assert "config" in data
+        # Check v2.2.0 features
         assert data["features"]["rate_limiting"] is True
         assert data["features"]["caching"] is True
-        assert data["features"]["batch_processing"] is True
+        assert data["features"]["batch"] is True
         assert data["features"]["multi_currency"] is True
-        assert data["features"]["confidence_scores"] is True
+        assert data["features"]["line_items"] is True
+        assert data["features"]["webhooks"] is True
+        assert data["features"]["pdf_password"] is True
+        assert "json" in data["features"]["export_formats"]
+        assert "csv" in data["features"]["export_formats"]
+        assert "xml" in data["features"]["export_formats"]
+
+
+class TestV1ApiRoutes:
+    """Tests for versioned API routes."""
+
+    def test_v1_health_endpoint(self, client):
+        """Test the v1 health endpoint."""
+        response = client.get("/v1/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
 
 
 class TestMetricsEndpoint:
@@ -49,12 +66,18 @@ class TestMetricsEndpoint:
         data = response.json()
         assert "metrics" in data
         assert "cache" in data
-        assert "rate_limiter" in data
 
     def test_metrics_with_invalid_auth(self, client, invalid_auth_headers):
         """Test metrics endpoint with invalid authentication."""
         response = client.get("/metrics", headers=invalid_auth_headers)
         assert response.status_code == 401
+
+    def test_prometheus_metrics_no_auth(self, client):
+        """Test Prometheus metrics endpoint (no auth required)."""
+        response = client.get("/metrics/prometheus")
+        assert response.status_code == 200
+        assert "invoice_ocr_uptime" in response.text
+        assert "invoice_ocr_requests_total" in response.text
 
 
 class TestInvoiceProcessing:
@@ -103,6 +126,32 @@ class TestInvoiceProcessing:
         assert "X-RateLimit-Reset" in response.headers
 
 
+class TestExportFormats:
+    """Tests for export format functionality."""
+
+    def test_export_csv_format(self, client, auth_headers, sample_pdf_content):
+        """Test CSV export format."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        response = client.post("/invoice-to-json?export=csv", headers=auth_headers, files=files)
+        # Will be 422 if PDF can't be processed, but header check is valid
+        if response.status_code == 200:
+            assert response.headers.get("content-type", "").startswith("text/csv")
+            assert "Content-Disposition" in response.headers
+
+    def test_export_xml_format(self, client, auth_headers, sample_pdf_content):
+        """Test XML export format."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        response = client.post("/invoice-to-json?export=xml", headers=auth_headers, files=files)
+        if response.status_code == 200:
+            assert "xml" in response.headers.get("content-type", "")
+
+    def test_invalid_export_format(self, client, auth_headers, sample_pdf_content):
+        """Test invalid export format is rejected."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        response = client.post("/invoice-to-json?export=pdf", headers=auth_headers, files=files)
+        assert response.status_code == 422  # Validation error
+
+
 class TestBatchProcessing:
     """Tests for batch processing endpoint."""
 
@@ -120,7 +169,7 @@ class TestBatchProcessing:
         ]
         response = client.post("/invoice-to-json/batch", headers=auth_headers, files=files)
         assert response.status_code == 400
-        assert "Too many files" in response.json()["detail"]
+        assert "Max" in response.json()["detail"] or "max" in response.json()["detail"].lower()
 
     def test_batch_mixed_valid_invalid(self, client, auth_headers, sample_pdf_content, invalid_pdf_content):
         """Test batch processing with mix of valid and invalid files."""
@@ -134,6 +183,7 @@ class TestBatchProcessing:
         data = response.json()
         assert data["total"] == 3
         assert data["failed"] >= 2  # At least invalid.pdf and not_pdf.txt should fail
+        assert "time_ms" in data
 
 
 class TestAuthentication:
@@ -144,7 +194,7 @@ class TestAuthentication:
         files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
         response = client.post("/invoice-to-json", files=files)
         assert response.status_code == 401
-        assert "Missing API key" in response.json()["detail"]
+        assert "API key" in response.json()["detail"]
 
     def test_invalid_api_key(self, client, invalid_auth_headers, sample_pdf_content):
         """Test request with invalid API key."""
@@ -172,3 +222,27 @@ class TestCaching:
         if response1.status_code == 200 and response2.status_code == 200:
             data2 = response2.json()
             assert data2.get("cached") is True
+
+
+class TestWebhooks:
+    """Tests for webhook functionality."""
+
+    def test_webhook_url_parameter(self, client, auth_headers, sample_pdf_content):
+        """Test that webhook URL parameter is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"webhook_url": "https://example.com/webhook"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        # Request should be accepted (webhook will be sent in background)
+        assert response.status_code in [200, 422]  # 422 if PDF processing fails
+
+
+class TestPasswordProtectedPdf:
+    """Tests for password-protected PDF support."""
+
+    def test_password_parameter(self, client, auth_headers, sample_pdf_content):
+        """Test that password parameter is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"password": "secret123"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        # Request should be accepted (even if PDF isn't actually encrypted)
+        assert response.status_code in [200, 422]

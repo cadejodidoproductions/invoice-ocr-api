@@ -1,11 +1,13 @@
 """
 Invoice OCR API - PDF Data Extraction Service
-Performance-optimized with authentication, rate limiting, and caching.
+Version 2.2.0 - Enhanced with line items, multi-currency, export formats, webhooks.
 """
 
 import asyncio
+import csv
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -14,198 +16,185 @@ import signal
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
+import httpx
 import pypdf
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# API Key for authentication (set via environment variable)
 API_KEY = os.getenv("INVOICE_OCR_API_KEY", None)
-
-# Rate limiting configuration
-RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))  # requests per window
-RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # window in seconds
-
-# File size limit (10MB)
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(10 * 1024 * 1024)))
-
-# Cache configuration
-CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 minutes
+CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
 CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "100"))
-
-# CORS configuration
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
-
-# Request timeout (seconds)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
-
-# Batch processing limit
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "10"))
+WEBHOOK_TIMEOUT = int(os.getenv("WEBHOOK_TIMEOUT", "10"))
+JSON_LOGGING = os.getenv("JSON_LOGGING", "false").lower() == "true"
 
 # =============================================================================
-# LOGGING CONFIGURATION
+# JSON STRUCTURED LOGGING
 # =============================================================================
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": getattr(record, "request_id", "N/A"),
+        })
 
 
-# Custom adapter to include request_id in logs
+log_handler = logging.StreamHandler()
+if JSON_LOGGING:
+    log_handler.setFormatter(JSONFormatter())
+else:
+    log_handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), handlers=[log_handler])
+
+
 class RequestIdAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
-        request_id = self.extra.get("request_id", "N/A")
-        kwargs["extra"] = {"request_id": request_id}
+        kwargs.setdefault("extra", {})["request_id"] = self.extra.get("request_id", "N/A")
         return msg, kwargs
 
 
 logger = logging.getLogger("invoice_ocr")
 
 # =============================================================================
-# PDF MAGIC BYTES VALIDATION
+# PDF VALIDATION
 # =============================================================================
 
-# PDF files start with these magic bytes
 PDF_MAGIC_BYTES = b"%PDF"
 
 
 def validate_pdf_magic_bytes(content: bytes) -> bool:
-    """Validate that file content starts with PDF magic bytes."""
     return content[:4] == PDF_MAGIC_BYTES
 
 
 # =============================================================================
-# PRE-COMPILED REGEX PATTERNS (Performance optimization)
+# REGEX PATTERNS
 # =============================================================================
 
-# Invoice number patterns - compiled once at module load
 INVOICE_PATTERNS = [
-    re.compile(r'(?:Invoice|Inv|INV)\s*[#:.\-]?\s*([A-Z0-9\-]+)', re.IGNORECASE),
-    re.compile(r'(?:Bill|Receipt)\s*[#:.\-]?\s*([A-Z0-9\-]+)', re.IGNORECASE),
-    re.compile(r'(?:Order)\s*[#:.\-]?\s*([A-Z0-9\-]+)', re.IGNORECASE),
-    re.compile(r'#\s*([A-Z0-9\-]{4,})', re.IGNORECASE),  # Generic # followed by ID
+    re.compile(r"(?:Invoice|Inv|INV)\s*[#:.\-]?\s*([A-Z0-9\-]+)", re.IGNORECASE),
+    re.compile(r"(?:Bill|Receipt)\s*[#:.\-]?\s*([A-Z0-9\-]+)", re.IGNORECASE),
+    re.compile(r"(?:Order)\s*[#:.\-]?\s*([A-Z0-9\-]+)", re.IGNORECASE),
+    re.compile(r"#\s*([A-Z0-9\-]{4,})", re.IGNORECASE),
 ]
 
-# Date patterns - multiple formats supported
+PO_PATTERNS = [
+    re.compile(r"(?:P\.?O\.?|Purchase\s*Order)\s*[#:.\-]?\s*([A-Z0-9\-]+)", re.IGNORECASE),
+    re.compile(r"PO\s*(?:Number|#)?[:\s]+([A-Z0-9\-]+)", re.IGNORECASE),
+]
+
 DATE_PATTERNS = [
-    # Month name formats: Jan 15, 2024 or January 15, 2024
-    (re.compile(
-        r'((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
-        r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
-        r'\s+\d{1,2},?\s+\d{4})',
-        re.IGNORECASE
-    ), 0.95),
-    # ISO format: 2024-01-15
-    (re.compile(r'(\d{4}-\d{2}-\d{2})'), 0.90),
-    # US format: 01/15/2024 or 01-15-2024
-    (re.compile(r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})'), 0.85),
-    # European format with dots: 15.01.2024
-    (re.compile(r'(\d{1,2}\.\d{1,2}\.\d{4})'), 0.80),
+    (re.compile(r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4})", re.IGNORECASE), 0.95),
+    (re.compile(r"(\d{4}-\d{2}-\d{2})"), 0.90),
+    (re.compile(r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})"), 0.85),
+    (re.compile(r"(\d{1,2}\.\d{1,2}\.\d{4})"), 0.80),
 ]
 
-# Currency patterns - multi-currency support
+DUE_DATE_PATTERNS = [
+    re.compile(r"(?:Due\s*Date|Payment\s*Due|Pay\s*By|Due\s*By)[:\s]+([^\n]{5,30})", re.IGNORECASE),
+    re.compile(r"(?:Due|Payable)[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})", re.IGNORECASE),
+]
+
+# Multi-currency patterns (expanded)
 CURRENCY_PATTERNS = [
-    # USD
-    (re.compile(r'\$\s*([\d,]+(?:\.\d{2})?)'), "USD", "$"),
-    # EUR
-    (re.compile(r'€\s*([\d,]+(?:[.,]\d{2})?)'), "EUR", "€"),
-    (re.compile(r'EUR\s*([\d,]+(?:[.,]\d{2})?)'), "EUR", "EUR"),
-    # GBP
-    (re.compile(r'£\s*([\d,]+(?:\.\d{2})?)'), "GBP", "£"),
-    (re.compile(r'GBP\s*([\d,]+(?:\.\d{2})?)'), "GBP", "GBP"),
-    # Generic amount (fallback)
-    (re.compile(r'(?:Total|Amount|Due|Balance)[:\s]+\$?([\d,]+(?:\.\d{2})?)'), "USD", "$"),
+    (re.compile(r"\$\s*([\d,]+(?:\.\d{2})?)"), "USD", "$"),
+    (re.compile(r"USD\s*([\d,]+(?:\.\d{2})?)"), "USD", "USD"),
+    (re.compile(r"€\s*([\d,]+(?:[.,]\d{2})?)"), "EUR", "€"),
+    (re.compile(r"EUR\s*([\d,]+(?:[.,]\d{2})?)"), "EUR", "EUR"),
+    (re.compile(r"£\s*([\d,]+(?:\.\d{2})?)"), "GBP", "£"),
+    (re.compile(r"GBP\s*([\d,]+(?:\.\d{2})?)"), "GBP", "GBP"),
+    (re.compile(r"C\$\s*([\d,]+(?:\.\d{2})?)"), "CAD", "C$"),
+    (re.compile(r"CAD\s*([\d,]+(?:\.\d{2})?)"), "CAD", "CAD"),
+    (re.compile(r"A\$\s*([\d,]+(?:\.\d{2})?)"), "AUD", "A$"),
+    (re.compile(r"AUD\s*([\d,]+(?:\.\d{2})?)"), "AUD", "AUD"),
+    (re.compile(r"¥\s*([\d,]+)"), "JPY", "¥"),
+    (re.compile(r"JPY\s*([\d,]+)"), "JPY", "JPY"),
+    (re.compile(r"CHF\s*([\d,]+(?:\.\d{2})?)"), "CHF", "CHF"),
+    (re.compile(r"₹\s*([\d,]+(?:\.\d{2})?)"), "INR", "₹"),
+    (re.compile(r"INR\s*([\d,]+(?:\.\d{2})?)"), "INR", "INR"),
+    (re.compile(r"CNY\s*([\d,]+(?:\.\d{2})?)"), "CNY", "CNY"),
+    (re.compile(r"RMB\s*([\d,]+(?:\.\d{2})?)"), "CNY", "RMB"),
 ]
 
-# Vendor/company patterns
-VENDOR_PATTERNS = [
-    re.compile(r'(?:From|Vendor|Seller|Company|Bill\s*From)[:\s]+([^\n]+)', re.IGNORECASE),
-    re.compile(r'^([A-Z][A-Za-z0-9\s&.,]+(?:Inc|LLC|Ltd|Corp|Co|Company)?\.?)[\s\n]', re.MULTILINE),
+TAX_PATTERNS = [
+    (re.compile(r"(?:Tax|VAT|GST|HST|Sales\s*Tax)[:\s]+[\$€£¥₹]?\s*([\d,]+(?:\.\d{2})?)"), "tax"),
+    (re.compile(r"(?:Subtotal|Sub-total|Sub\s*Total)[:\s]+[\$€£¥₹]?\s*([\d,]+(?:\.\d{2})?)"), "subtotal"),
+    (re.compile(r"(?:Shipping|Freight|Delivery)[:\s]+[\$€£¥₹]?\s*([\d,]+(?:\.\d{2})?)"), "shipping"),
+    (re.compile(r"(?:Discount)[:\s]+[\$€£¥₹]?\s*-?([\d,]+(?:\.\d{2})?)"), "discount"),
+    (re.compile(r"(?:Grand\s*Total|Total\s*Due|Amount\s*Due|Total)[:\s]+[\$€£¥₹]?\s*([\d,]+(?:\.\d{2})?)"), "total"),
 ]
+
+LINE_ITEM_PATTERN = re.compile(
+    r"^(.{5,50}?)\s{2,}(\d+(?:\.\d+)?)\s+[\$€£]?([\d,]+(?:\.\d{2})?)\s+[\$€£]?([\d,]+(?:\.\d{2})?)$",
+    re.MULTILINE,
+)
+
+VENDOR_PATTERNS = [
+    re.compile(r"(?:From|Vendor|Seller|Bill\s*From)[:\s]+([^\n]+)", re.IGNORECASE),
+    re.compile(r"^([A-Z][A-Za-z0-9\s&.,]+(?:Inc|LLC|Ltd|Corp|Co)?\.?)[\s\n]", re.MULTILINE),
+]
+
+ADDRESS_PATTERN = re.compile(
+    r"(\d+\s+[A-Za-z\s]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln)[.,]?\s*"
+    r"(?:Suite|Ste|Apt|Unit|#)?\s*\d*[.,]?\s*[A-Za-z\s]+,?\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)",
+    re.IGNORECASE,
+)
 
 # =============================================================================
-# IN-MEMORY RATE LIMITER
+# RATE LIMITER
 # =============================================================================
 
 
 class RateLimiter:
-    """
-    Thread-safe in-memory rate limiter using sliding window.
-
-    Note: When running with multiple workers (processes), each worker maintains
-    its own rate limit state. For distributed rate limiting, use Redis or similar.
-    """
-
     def __init__(self, max_requests: int, window_seconds: int):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.requests: dict[str, list[float]] = defaultdict(list)
         self._lock = threading.Lock()
-        self._last_cleanup = time.time()
-        self._cleanup_interval = 300  # Clean up stale entries every 5 minutes
-
-    def _cleanup_stale_entries(self, now: float) -> None:
-        """Remove entries for clients with no recent requests."""
-        if now - self._last_cleanup < self._cleanup_interval:
-            return
-
-        window_start = now - self.window_seconds
-        stale_clients = [
-            client_id
-            for client_id, timestamps in self.requests.items()
-            if not timestamps or max(timestamps) < window_start
-        ]
-        for client_id in stale_clients:
-            del self.requests[client_id]
-        self._last_cleanup = now
 
     def is_allowed(self, client_id: str) -> tuple[bool, dict]:
-        """Check if request is allowed and return rate limit info."""
         now = time.time()
-        window_start = now - self.window_seconds
-
         with self._lock:
-            # Periodic cleanup of stale entries
-            self._cleanup_stale_entries(now)
-
-            # Clean old requests outside the window for this client
-            self.requests[client_id] = [
-                ts for ts in self.requests[client_id] if ts > window_start
-            ]
-
-            current_count = len(self.requests[client_id])
-            remaining = max(0, self.max_requests - current_count)
-
-            if current_count >= self.max_requests:
-                # Calculate reset time
-                oldest_in_window = (
-                    min(self.requests[client_id]) if self.requests[client_id] else now
-                )
-                reset_time = int(oldest_in_window + self.window_seconds)
-                return False, {
-                    "X-RateLimit-Limit": str(self.max_requests),
-                    "X-RateLimit-Remaining": "0",
-                    "X-RateLimit-Reset": str(reset_time),
-                }
-
-            # Record this request
+            self.requests[client_id] = [t for t in self.requests[client_id] if t > now - self.window_seconds]
+            if len(self.requests[client_id]) >= self.max_requests:
+                return False, {"X-RateLimit-Limit": str(self.max_requests), "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(int(min(self.requests[client_id]) + self.window_seconds))}
             self.requests[client_id].append(now)
-
-            return True, {
-                "X-RateLimit-Limit": str(self.max_requests),
-                "X-RateLimit-Remaining": str(remaining - 1),
-                "X-RateLimit-Reset": str(int(now + self.window_seconds)),
-            }
+            return True, {"X-RateLimit-Limit": str(self.max_requests), "X-RateLimit-Remaining": str(self.max_requests - len(self.requests[client_id])), "X-RateLimit-Reset": str(int(now + self.window_seconds))}
 
 
 rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
@@ -216,153 +205,297 @@ rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 
 
 class ResponseCache:
-    """
-    Thread-safe in-memory cache with TTL for API responses.
-
-    Note: When running with multiple workers (processes), each worker maintains
-    its own cache. For shared caching, use Redis or similar.
-    """
-
     def __init__(self, max_size: int, ttl_seconds: int):
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
         self.cache: dict[str, tuple[float, dict]] = {}
         self._lock = threading.Lock()
 
-    def _generate_key(self, content: bytes) -> str:
-        """Generate cache key from file content hash."""
-        return hashlib.sha256(content).hexdigest()
-
     def get(self, content: bytes) -> Optional[dict]:
-        """Get cached response if exists and not expired."""
-        key = self._generate_key(content)
+        key = hashlib.sha256(content).hexdigest()
         with self._lock:
-            if key in self.cache:
-                timestamp, data = self.cache[key]
-                if time.time() - timestamp < self.ttl_seconds:
-                    return data.copy()  # Return copy to prevent mutation
-                else:
-                    # Expired, remove it
-                    del self.cache[key]
+            if key in self.cache and time.time() - self.cache[key][0] < self.ttl_seconds:
+                return self.cache[key][1].copy()
+            self.cache.pop(key, None)
         return None
 
-    def set(self, content: bytes, data: dict) -> None:
-        """Cache a response."""
-        key = self._generate_key(content)
+    def set(self, content: bytes, data: dict):
+        key = hashlib.sha256(content).hexdigest()
         with self._lock:
-            # Evict oldest entries if at capacity
             if len(self.cache) >= self.max_size:
-                oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][0])
-                del self.cache[oldest_key]
-
-            self.cache[key] = (time.time(), data.copy())  # Store copy
+                oldest = min(self.cache, key=lambda k: self.cache[k][0])
+                del self.cache[oldest]
+            self.cache[key] = (time.time(), data.copy())
 
     def stats(self) -> dict:
-        """Return cache statistics."""
-        now = time.time()
         with self._lock:
-            valid_entries = sum(
-                1 for ts, _ in self.cache.values() if now - ts < self.ttl_seconds
-            )
-            return {
-                "total_entries": len(self.cache),
-                "valid_entries": valid_entries,
-                "max_size": self.max_size,
-                "ttl_seconds": self.ttl_seconds,
-            }
+            valid = sum(1 for t, _ in self.cache.values() if time.time() - t < self.ttl_seconds)
+            return {"total_entries": len(self.cache), "valid_entries": valid, "max_size": self.max_size}
 
 
 response_cache = ResponseCache(CACHE_MAX_SIZE, CACHE_TTL)
 
 # =============================================================================
-# METRICS COLLECTOR
+# METRICS (with Prometheus export)
 # =============================================================================
 
 
 class MetricsCollector:
-    """
-    Thread-safe metrics collector for monitoring.
-
-    Note: When running with multiple workers (processes), each worker maintains
-    its own metrics. For aggregated metrics, use Prometheus or similar.
-    """
-
     def __init__(self):
         self.start_time = time.time()
-        self.total_requests = 0
-        self.successful_requests = 0
-        self.failed_requests = 0
-        self.cache_hits = 0
-        self.cache_misses = 0
-        self.total_processing_time = 0.0
-        self.rate_limited_requests = 0
-        self.auth_failures = 0
-        self.timeout_errors = 0
-        self.batch_requests = 0
         self._lock = threading.Lock()
+        self._c = defaultdict(int)
+        self._times: list[float] = []
 
-    def record_request(
-        self, success: bool, processing_time: float, cache_hit: bool = False
-    ):
+    def inc(self, name: str, val: int = 1):
         with self._lock:
-            self.total_requests += 1
-            self.total_processing_time += processing_time
-            if success:
-                self.successful_requests += 1
-            else:
-                self.failed_requests += 1
-            if cache_hit:
-                self.cache_hits += 1
-            else:
-                self.cache_misses += 1
+            self._c[name] += val
 
-    def record_rate_limit(self):
+    def observe_time(self, val: float):
         with self._lock:
-            self.rate_limited_requests += 1
+            self._times.append(val)
+            if len(self._times) > 1000:
+                self._times = self._times[-1000:]
 
-    def record_auth_failure(self):
+    def get(self) -> dict:
         with self._lock:
-            self.auth_failures += 1
-
-    def record_timeout(self):
-        with self._lock:
-            self.timeout_errors += 1
-
-    def record_batch_request(self):
-        with self._lock:
-            self.batch_requests += 1
-
-    def get_metrics(self) -> dict:
-        with self._lock:
-            uptime = time.time() - self.start_time
-            avg_processing_time = (
-                self.total_processing_time / self.total_requests
-                if self.total_requests > 0
-                else 0
-            )
+            avg = sum(self._times) / len(self._times) if self._times else 0
             return {
-                "uptime_seconds": round(uptime, 2),
-                "total_requests": self.total_requests,
-                "successful_requests": self.successful_requests,
-                "failed_requests": self.failed_requests,
-                "cache_hits": self.cache_hits,
-                "cache_misses": self.cache_misses,
-                "cache_hit_rate": round(
-                    self.cache_hits / max(1, self.cache_hits + self.cache_misses) * 100,
-                    2,
-                ),
-                "avg_processing_time_ms": round(avg_processing_time * 1000, 2),
-                "rate_limited_requests": self.rate_limited_requests,
-                "auth_failures": self.auth_failures,
-                "timeout_errors": self.timeout_errors,
-                "batch_requests": self.batch_requests,
+                "uptime_seconds": round(time.time() - self.start_time, 2),
+                "requests_total": self._c["requests"],
+                "requests_success": self._c["success"],
+                "requests_failed": self._c["failed"],
+                "cache_hits": self._c["cache_hit"],
+                "cache_misses": self._c["cache_miss"],
+                "rate_limited": self._c["rate_limited"],
+                "auth_failures": self._c["auth_fail"],
+                "timeouts": self._c["timeout"],
+                "webhooks_sent": self._c["webhook"],
+                "avg_time_ms": round(avg * 1000, 2),
             }
+
+    def prometheus(self) -> str:
+        m = self.get()
+        lines = [
+            f"# HELP invoice_ocr_uptime Uptime in seconds",
+            f"# TYPE invoice_ocr_uptime gauge",
+            f"invoice_ocr_uptime {m['uptime_seconds']}",
+            f"# HELP invoice_ocr_requests_total Total requests",
+            f"# TYPE invoice_ocr_requests_total counter",
+            f"invoice_ocr_requests_total {m['requests_total']}",
+            f"invoice_ocr_requests_success {m['requests_success']}",
+            f"invoice_ocr_requests_failed {m['requests_failed']}",
+            f"invoice_ocr_cache_hits {m['cache_hits']}",
+            f"invoice_ocr_cache_misses {m['cache_misses']}",
+            f"invoice_ocr_rate_limited {m['rate_limited']}",
+            f"invoice_ocr_avg_time_ms {m['avg_time_ms']}",
+        ]
+        return "\n".join(lines) + "\n"
 
 
 metrics = MetricsCollector()
 
 # =============================================================================
-# GRACEFUL SHUTDOWN
+# EXTRACTION FUNCTIONS
+# =============================================================================
+
+
+def parse_amount(s: str) -> float:
+    s = s.replace(" ", "").replace(",", "")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def extract_vendor(text: str) -> tuple[str, float]:
+    for p in VENDOR_PATTERNS:
+        m = p.search(text)
+        if m and 2 < len(m.group(1).strip()) < 100:
+            return m.group(1).strip(), 0.85
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    for l in lines[:5]:
+        if not re.match(r"^[\d/$€£¥₹]", l) and len(l) > 2:
+            return l[:100], 0.60
+    return "Unknown", 0.0
+
+
+def extract_invoice_number(text: str) -> tuple[str, float]:
+    for p in INVOICE_PATTERNS:
+        m = p.search(text)
+        if m and len(m.group(1)) >= 2:
+            return m.group(1).strip(), 0.80
+    return "N/A", 0.0
+
+
+def extract_po_number(text: str) -> tuple[str, float]:
+    for p in PO_PATTERNS:
+        m = p.search(text)
+        if m:
+            return m.group(1).strip(), 0.85
+    return "N/A", 0.0
+
+
+def extract_date(text: str) -> tuple[str, float]:
+    for p, conf in DATE_PATTERNS:
+        m = p.search(text)
+        if m:
+            return m.group(1), conf
+    return "N/A", 0.0
+
+
+def extract_due_date(text: str) -> tuple[str, float]:
+    for p in DUE_DATE_PATTERNS:
+        m = p.search(text)
+        if m:
+            val = m.group(1).strip()
+            for dp, c in DATE_PATTERNS:
+                dm = dp.search(val)
+                if dm:
+                    return dm.group(1), c
+            return val[:30], 0.70
+    return "N/A", 0.0
+
+
+def extract_amounts(text: str) -> dict:
+    result = {"subtotal": None, "tax": None, "shipping": None, "discount": None, "total": None, "currency": "USD", "all_amounts": []}
+    for p, t in TAX_PATTERNS:
+        m = p.search(text)
+        if m:
+            result[t] = parse_amount(m.group(1))
+    for p, cur, sym in CURRENCY_PATTERNS:
+        matches = p.findall(text)
+        if matches:
+            result["currency"] = cur
+            result["all_amounts"] = [parse_amount(m) for m in matches if parse_amount(m) > 0]
+            break
+    if result["total"] is None and result["all_amounts"]:
+        result["total"] = max(result["all_amounts"])
+    return result
+
+
+def extract_line_items(text: str) -> list[dict]:
+    items = []
+    for m in LINE_ITEM_PATTERN.findall(text)[:20]:
+        if len(m) >= 4:
+            items.append({"description": m[0].strip(), "quantity": parse_amount(m[1]), "unit_price": parse_amount(m[2]), "amount": parse_amount(m[3])})
+    return items
+
+
+def extract_addresses(text: str) -> list[str]:
+    return [m.strip() for m in ADDRESS_PATTERN.findall(text)[:3]]
+
+
+def extract_invoice_data(text: str, log: RequestIdAdapter) -> dict:
+    vendor, vc = extract_vendor(text)
+    inv_no, ic = extract_invoice_number(text)
+    po_no, pc = extract_po_number(text)
+    date, dc = extract_date(text)
+    due, duc = extract_due_date(text)
+    amounts = extract_amounts(text)
+    items = extract_line_items(text)
+    addrs = extract_addresses(text)
+
+    confs = [c for c in [vc, ic, dc] if c > 0]
+    overall = round(sum(confs) / len(confs), 2) if confs else 0.0
+
+    log.info(f"Extracted: vendor={vendor[:30]}, inv={inv_no}, total={amounts['total']}, items={len(items)}")
+
+    return {
+        "vendor": vendor,
+        "invoice_no": inv_no,
+        "po_number": po_no,
+        "date": date,
+        "due_date": due,
+        "subtotal": amounts["subtotal"],
+        "tax": amounts["tax"],
+        "shipping": amounts["shipping"],
+        "discount": amounts["discount"],
+        "total": amounts["total"],
+        "currency": amounts["currency"],
+        "all_amounts": amounts["all_amounts"],
+        "line_items": items,
+        "addresses": addrs,
+        "confidence": {"overall": overall, "vendor": vc, "invoice_no": ic, "po_number": pc, "date": dc, "due_date": duc},
+    }
+
+
+# =============================================================================
+# PDF PROCESSING
+# =============================================================================
+
+
+async def process_pdf(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None) -> dict:
+    if not validate_pdf_magic_bytes(content):
+        raise ValueError("Invalid PDF: bad magic bytes")
+
+    pdf = io.BytesIO(content)
+    try:
+        reader = pypdf.PdfReader(pdf, password=password) if password else pypdf.PdfReader(pdf)
+        if reader.is_encrypted and not password:
+            raise ValueError("PDF is encrypted. Provide password.")
+    except pypdf.errors.FileNotDecryptedError:
+        raise ValueError("PDF encrypted. Wrong password.")
+
+    text = "\n".join(p.extract_text() or "" for p in reader.pages)
+    if not text.strip():
+        raise ValueError("No text extracted. PDF may be scanned.")
+
+    result = extract_invoice_data(text, log)
+    result["file_type"] = "PDF"
+    result["pages"] = len(reader.pages)
+    result["filename"] = filename
+    return result
+
+
+# =============================================================================
+# EXPORT FUNCTIONS
+# =============================================================================
+
+
+def to_csv(data: dict) -> str:
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["Field", "Value"])
+    for k in ["vendor", "invoice_no", "po_number", "date", "due_date", "currency", "subtotal", "tax", "shipping", "discount", "total"]:
+        w.writerow([k, data.get(k, "")])
+    if data.get("line_items"):
+        w.writerow([])
+        w.writerow(["Description", "Qty", "Unit Price", "Amount"])
+        for i in data["line_items"]:
+            w.writerow([i.get("description"), i.get("quantity"), i.get("unit_price"), i.get("amount")])
+    return out.getvalue()
+
+
+def to_xml(data: dict) -> str:
+    root = ET.Element("invoice")
+    for k in ["vendor", "invoice_no", "po_number", "date", "due_date", "currency", "subtotal", "tax", "shipping", "discount", "total"]:
+        ET.SubElement(root, k).text = str(data.get(k) or "")
+    if data.get("line_items"):
+        items = ET.SubElement(root, "line_items")
+        for i in data["line_items"]:
+            item = ET.SubElement(items, "item")
+            for f in ["description", "quantity", "unit_price", "amount"]:
+                ET.SubElement(item, f).text = str(i.get(f, ""))
+    return ET.tostring(root, encoding="unicode")
+
+
+# =============================================================================
+# WEBHOOK
+# =============================================================================
+
+
+async def send_webhook(url: str, data: dict, req_id: str):
+    metrics.inc("webhook")
+    try:
+        async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as c:
+            await c.post(url, json={"request_id": req_id, "data": data, "ts": datetime.utcnow().isoformat()})
+    except Exception:
+        metrics.inc("webhook_fail")
+
+
+# =============================================================================
+# FASTAPI APP
 # =============================================================================
 
 shutdown_event = asyncio.Event()
@@ -370,655 +503,199 @@ shutdown_event = asyncio.Event()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Handle application lifespan events for graceful shutdown."""
-    # Startup
-    logger.info("Invoice OCR API starting up...")
-
-    # Setup signal handlers for graceful shutdown
-    loop = asyncio.get_event_loop()
-
-    def handle_shutdown(sig):
-        logger.info(f"Received signal {sig}, initiating graceful shutdown...")
-        shutdown_event.set()
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, handle_shutdown, sig)
-
+    logger.info("Starting Invoice OCR API v2.2.0")
     yield
-
-    # Shutdown
-    logger.info("Invoice OCR API shutting down...")
-    # Allow in-flight requests to complete (max 10 seconds)
-    await asyncio.sleep(0.5)
-    logger.info("Shutdown complete")
+    logger.info("Shutting down")
 
 
-# =============================================================================
-# FASTAPI APPLICATION
-# =============================================================================
+app = FastAPI(title="Invoice OCR API", version="2.2.0", lifespan=lifespan)
+v1 = APIRouter(prefix="/v1", tags=["v1"])
 
-app = FastAPI(
-    title="Invoice OCR API",
-    description="Extract structured data from PDF invoices",
-    version="2.1.0",
-    lifespan=lifespan,
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-    expose_headers=[
-        "X-Request-ID",
-        "X-RateLimit-Limit",
-        "X-RateLimit-Remaining",
-        "X-RateLimit-Reset",
-    ],
-)
-
-# =============================================================================
-# MIDDLEWARE & DEPENDENCIES
-# =============================================================================
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+                   expose_headers=["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"])
 
 
 @app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    """Add unique request ID to each request for tracing."""
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
-    request.state.request_id = request_id
-
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
-
-
-def get_client_id(request: Request) -> str:
-    """Extract client identifier for rate limiting."""
-    # Use API key if present, otherwise use IP
-    api_key = request.headers.get("X-API-Key")
-    if api_key:
-        return f"key:{api_key[:8]}"
-
-    # Use forwarded IP if behind proxy, otherwise direct IP
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return f"ip:{forwarded.split(',')[0].strip()}"
-    return f"ip:{request.client.host if request.client else 'unknown'}"
+async def req_id_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
+    request.state.request_id = rid
+    request.state.rate_limit_headers = {}
+    resp = await call_next(request)
+    resp.headers["X-Request-ID"] = rid
+    return resp
 
 
-def get_logger(request: Request) -> RequestIdAdapter:
-    """Get a logger with request ID context."""
-    request_id = getattr(request.state, "request_id", "N/A")
-    return RequestIdAdapter(logger, {"request_id": request_id})
+def get_log(request: Request) -> RequestIdAdapter:
+    return RequestIdAdapter(logger, {"request_id": getattr(request.state, "request_id", "N/A")})
 
 
-async def verify_api_key(request: Request):
-    """Verify API key if authentication is enabled."""
-    if API_KEY is None:
-        # Authentication disabled
-        return True
-
-    provided_key = request.headers.get("X-API-Key")
-    if not provided_key:
-        metrics.record_auth_failure()
-        raise HTTPException(
-            status_code=401, detail="Missing API key. Provide key in X-API-Key header."
-        )
-
-    # Use constant-time comparison to prevent timing attacks
-    if not secrets.compare_digest(provided_key.encode(), API_KEY.encode()):
-        metrics.record_auth_failure()
-        raise HTTPException(status_code=401, detail="Invalid API key.")
-    return True
+async def auth(request: Request):
+    if API_KEY and (not request.headers.get("X-API-Key") or not secrets.compare_digest(request.headers.get("X-API-Key", "").encode(), API_KEY.encode())):
+        metrics.inc("auth_fail")
+        raise HTTPException(401, "Invalid API key")
 
 
-async def check_rate_limit(request: Request):
-    """Check if request is within rate limits."""
-    client_id = get_client_id(request)
-    allowed, headers = rate_limiter.is_allowed(client_id)
-
-    # Store headers for response
-    request.state.rate_limit_headers = headers
-
-    if not allowed:
-        metrics.record_rate_limit()
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded. Maximum {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds.",
-            headers=headers,
-        )
-    return True
+async def rate_limit(request: Request):
+    ok, hdrs = rate_limiter.is_allowed(request.headers.get("X-API-Key", request.client.host if request.client else "unknown"))
+    request.state.rate_limit_headers = hdrs
+    if not ok:
+        metrics.inc("rate_limited")
+        raise HTTPException(429, "Rate limited", headers=hdrs)
 
 
 # =============================================================================
-# PDF EXTRACTION LOGIC
-# =============================================================================
-
-
-def calculate_confidence(value: str, pattern_confidence: float, text: str) -> float:
-    """Calculate confidence score for an extracted value."""
-    if not value or value in ("N/A", "Unknown", "No date found"):
-        return 0.0
-
-    # Base confidence from pattern
-    confidence = pattern_confidence
-
-    # Boost if value appears multiple times
-    occurrences = text.lower().count(value.lower())
-    if occurrences > 1:
-        confidence = min(1.0, confidence + 0.05 * (occurrences - 1))
-
-    return round(confidence, 2)
-
-
-def extract_vendor(full_text: str) -> tuple[str, float]:
-    """Extract vendor name with confidence score."""
-    # Try specific patterns first
-    for pattern in VENDOR_PATTERNS:
-        match = pattern.search(full_text)
-        if match:
-            vendor = match.group(1).strip()
-            if len(vendor) > 2 and len(vendor) < 100:
-                return vendor, 0.85
-
-    # Fallback to first non-empty line
-    lines = [
-        line.strip() for line in full_text.strip().split("\n") if line.strip()
-    ]
-    if lines:
-        # Skip lines that look like dates or amounts
-        for line in lines[:5]:
-            if not re.match(r'^[\d/$€£]', line) and len(line) > 2:
-                return line[:100], 0.60
-
-    return "Unknown", 0.0
-
-
-def extract_invoice_number(full_text: str) -> tuple[str, float]:
-    """Extract invoice number with confidence score."""
-    for pattern in INVOICE_PATTERNS:
-        match = pattern.search(full_text)
-        if match:
-            invoice_no = match.group(1).strip()
-            if len(invoice_no) >= 2:
-                # Higher confidence for longer, more specific matches
-                confidence = 0.80 if len(invoice_no) >= 4 else 0.65
-                return invoice_no, confidence
-
-    return "N/A", 0.0
-
-
-def extract_date(full_text: str) -> tuple[str, float]:
-    """Extract date with confidence score."""
-    for pattern, confidence in DATE_PATTERNS:
-        match = pattern.search(full_text)
-        if match:
-            return match.group(1), confidence
-
-    return "No date found", 0.0
-
-
-def extract_amounts(full_text: str) -> tuple[list[dict], str, float]:
-    """Extract all monetary amounts with currency detection."""
-    all_amounts = []
-    detected_currency = "USD"
-    currency_symbol = "$"
-
-    for pattern, currency, symbol in CURRENCY_PATTERNS:
-        matches = pattern.findall(full_text)
-        if matches:
-            detected_currency = currency
-            currency_symbol = symbol
-            for match in matches:
-                try:
-                    # Handle European number format (1.234,56)
-                    cleaned = match.replace(" ", "")
-                    if "," in cleaned and "." in cleaned:
-                        # Determine format by position
-                        if cleaned.rfind(",") > cleaned.rfind("."):
-                            # European: 1.234,56
-                            cleaned = cleaned.replace(".", "").replace(",", ".")
-                        else:
-                            # US: 1,234.56
-                            cleaned = cleaned.replace(",", "")
-                    else:
-                        cleaned = cleaned.replace(",", "")
-
-                    val = float(cleaned)
-                    if val > 0:
-                        all_amounts.append(
-                            {"amount": val, "currency": currency, "symbol": symbol}
-                        )
-                except ValueError:
-                    pass
-            break  # Use first matching currency
-
-    # Calculate total confidence based on amounts found
-    confidence = 0.0
-    if all_amounts:
-        confidence = min(0.95, 0.70 + 0.05 * len(all_amounts))
-
-    return all_amounts, detected_currency, confidence
-
-
-def extract_invoice_data(full_text: str, log: RequestIdAdapter) -> dict:
-    """Extract structured data from PDF text with confidence scores."""
-
-    # Extract vendor
-    vendor, vendor_confidence = extract_vendor(full_text)
-    log.info(f"Extracted vendor: {vendor[:50]} (confidence: {vendor_confidence})")
-
-    # Extract invoice number
-    invoice_no, invoice_confidence = extract_invoice_number(full_text)
-    log.info(
-        f"Extracted invoice number: {invoice_no} (confidence: {invoice_confidence})"
-    )
-
-    # Extract date
-    date, date_confidence = extract_date(full_text)
-    log.info(f"Extracted date: {date} (confidence: {date_confidence})")
-
-    # Extract amounts
-    amounts_data, currency, amounts_confidence = extract_amounts(full_text)
-    log.info(
-        f"Found {len(amounts_data)} amounts in {currency} (confidence: {amounts_confidence})"
-    )
-
-    # Get amounts as simple list for backward compatibility
-    amounts = [a["amount"] for a in amounts_data]
-    total = max(amounts) if amounts else 0.0
-
-    # Calculate overall confidence
-    confidences = [vendor_confidence, invoice_confidence, date_confidence, amounts_confidence]
-    valid_confidences = [c for c in confidences if c > 0]
-    overall_confidence = (
-        round(sum(valid_confidences) / len(valid_confidences), 2)
-        if valid_confidences
-        else 0.0
-    )
-
-    return {
-        "vendor": vendor,
-        "invoice_no": invoice_no,
-        "date": date,
-        "total": total,
-        "currency": currency,
-        "all_amounts": amounts,
-        "confidence": {
-            "overall": overall_confidence,
-            "vendor": vendor_confidence,
-            "invoice_no": invoice_confidence,
-            "date": date_confidence,
-            "amounts": amounts_confidence,
-        },
-    }
-
-
-async def process_single_pdf(
-    content: bytes, filename: str, log: RequestIdAdapter
-) -> dict:
-    """Process a single PDF file and return extracted data."""
-    # Validate PDF magic bytes
-    if not validate_pdf_magic_bytes(content):
-        raise ValueError("Invalid PDF file: magic bytes not found")
-
-    # Extract text from PDF
-    pdf_file = io.BytesIO(content)
-    pdf_reader = pypdf.PdfReader(pdf_file)
-
-    full_text = ""
-    for page_num, page in enumerate(pdf_reader.pages):
-        page_text = page.extract_text() or ""
-        full_text += page_text
-        log.debug(f"Extracted {len(page_text)} chars from page {page_num + 1}")
-
-    if not full_text.strip():
-        raise ValueError(
-            "Could not extract text from PDF. The file may be scanned/image-based."
-        )
-
-    # Extract invoice data
-    result = extract_invoice_data(full_text, log)
-    result["file_type"] = "PDF"
-    result["pages_processed"] = len(pdf_reader.pages)
-    result["filename"] = filename
-
-    return result
-
-
-# =============================================================================
-# API ENDPOINTS
+# ENDPOINTS
 # =============================================================================
 
 
 @app.post("/invoice-to-json")
 async def process_invoice(
     request: Request,
+    bg: BackgroundTasks,
     file: UploadFile = File(...),
-    _auth: bool = Depends(verify_api_key),
-    _rate: bool = Depends(check_rate_limit),
+    password: Optional[str] = Form(None),
+    webhook_url: Optional[str] = Form(None),
+    export: Optional[str] = Query(None, regex="^(json|csv|xml)$"),
+    _a: bool = Depends(auth),
+    _r: bool = Depends(rate_limit),
 ):
-    """
-    Extract structured data from a PDF invoice.
-
-    - **file**: PDF file to process (max 10MB)
-
-    Returns extracted invoice data including vendor, invoice number, date, amounts,
-    currency, and confidence scores.
-    """
-    start_time = time.time()
-    log = get_logger(request)
-    cache_hit = False
+    """Extract data from PDF invoice. Supports password-protected PDFs, webhooks, and export formats."""
+    t0 = time.time()
+    log = get_log(request)
+    metrics.inc("requests")
 
     try:
-        # Read file content with timeout
-        try:
-            content = await asyncio.wait_for(
-                file.read(), timeout=REQUEST_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            metrics.record_timeout()
-            raise HTTPException(
-                status_code=408, detail=f"Request timeout after {REQUEST_TIMEOUT}s"
-            )
+        content = await asyncio.wait_for(file.read(), REQUEST_TIMEOUT)
+    except asyncio.TimeoutError:
+        metrics.inc("timeout")
+        raise HTTPException(408, "Timeout")
 
-        filename = file.filename.lower() if file.filename else ""
-        log.info(f"Processing file: {filename} ({len(content)} bytes)")
+    fn = (file.filename or "").lower()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, "File too large")
+    if not fn.endswith(".pdf"):
+        raise HTTPException(400, "Only PDF supported")
+    if not validate_pdf_magic_bytes(content):
+        raise HTTPException(400, "Invalid PDF")
 
-        # Validate file size
-        if len(content) > MAX_FILE_SIZE:
-            log.warning(
-                f"File too large: {len(content)} bytes (max: {MAX_FILE_SIZE})"
-            )
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.",
-            )
+    cached = response_cache.get(content) if not password else None
+    if cached:
+        metrics.inc("cache_hit")
+        metrics.inc("success")
+        if webhook_url:
+            bg.add_task(send_webhook, webhook_url, cached, request.state.request_id)
+        return _resp(cached, export, request, True)
 
-        # Validate file extension
-        if not filename.endswith(".pdf"):
-            log.warning(f"Unsupported file extension: {filename}")
-            raise HTTPException(
-                status_code=400,
-                detail="Only PDF files are supported. Please upload a .pdf file.",
-            )
+    metrics.inc("cache_miss")
+    try:
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, lambda: asyncio.run(process_pdf(content, fn, log, password))),
+            REQUEST_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        metrics.inc("timeout")
+        metrics.inc("failed")
+        raise HTTPException(408, "Processing timeout")
+    except ValueError as e:
+        metrics.inc("failed")
+        raise HTTPException(422, str(e))
 
-        # Validate PDF magic bytes
-        if not validate_pdf_magic_bytes(content):
-            log.warning(f"Invalid PDF magic bytes: {filename}")
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid PDF file. File does not appear to be a valid PDF.",
-            )
-
-        # Check cache first
-        cached_result = response_cache.get(content)
-        if cached_result:
-            log.info("Cache hit - returning cached result")
-            cache_hit = True
-            processing_time = time.time() - start_time
-            metrics.record_request(
-                success=True, processing_time=processing_time, cache_hit=True
-            )
-
-            response = JSONResponse(content={**cached_result, "cached": True})
-            for key, value in request.state.rate_limit_headers.items():
-                response.headers[key] = value
-            return response
-
-        # Process PDF with timeout
-        try:
-            result = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None, lambda: asyncio.run(process_single_pdf(content, filename, log))
-                ),
-                timeout=REQUEST_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            metrics.record_timeout()
-            raise HTTPException(
-                status_code=408,
-                detail=f"PDF processing timeout after {REQUEST_TIMEOUT}s",
-            )
-
-        # Cache the result
+    if not password:
         response_cache.set(content, result)
 
-        processing_time = time.time() - start_time
-        log.info(f"Processing completed in {processing_time*1000:.2f}ms")
-        metrics.record_request(
-            success=True, processing_time=processing_time, cache_hit=False
-        )
+    metrics.inc("success")
+    metrics.observe_time(time.time() - t0)
+    if webhook_url:
+        bg.add_task(send_webhook, webhook_url, result, request.state.request_id)
 
-        response = JSONResponse(content=result)
-        for key, value in request.state.rate_limit_headers.items():
-            response.headers[key] = value
-        return response
+    return _resp(result, export, request, False)
 
-    except HTTPException:
-        raise
-    except ValueError as e:
-        processing_time = time.time() - start_time
-        log.warning(f"Validation error: {str(e)}")
-        metrics.record_request(
-            success=False, processing_time=processing_time, cache_hit=cache_hit
-        )
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        processing_time = time.time() - start_time
-        log.error(f"Error processing invoice: {str(e)}")
-        metrics.record_request(
-            success=False, processing_time=processing_time, cache_hit=cache_hit
-        )
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+
+def _resp(data: dict, fmt: Optional[str], request: Request, cached: bool) -> Response:
+    hdrs = dict(request.state.rate_limit_headers)
+    if fmt == "csv":
+        return Response(to_csv(data), media_type="text/csv", headers={**hdrs, "Content-Disposition": "attachment; filename=invoice.csv"})
+    if fmt == "xml":
+        return Response(to_xml(data), media_type="application/xml", headers={**hdrs, "Content-Disposition": "attachment; filename=invoice.xml"})
+    r = JSONResponse({**data, "cached": cached})
+    for k, v in hdrs.items():
+        r.headers[k] = v
+    return r
 
 
 @app.post("/invoice-to-json/batch")
-async def process_invoice_batch(
-    request: Request,
-    files: list[UploadFile] = File(...),
-    _auth: bool = Depends(verify_api_key),
-    _rate: bool = Depends(check_rate_limit),
-):
-    """
-    Process multiple PDF invoices in a single request.
+async def batch(request: Request, files: list[UploadFile] = File(...), password: Optional[str] = Form(None), _a: bool = Depends(auth), _r: bool = Depends(rate_limit)):
+    """Process multiple PDFs in one request."""
+    t0 = time.time()
+    log = get_log(request)
+    metrics.inc("requests")
 
-    - **files**: List of PDF files to process (max 10 files, 10MB each)
-
-    Returns a list of extraction results for each file.
-    """
-    start_time = time.time()
-    log = get_logger(request)
-    metrics.record_batch_request()
-
-    # Validate batch size
     if len(files) > MAX_BATCH_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Too many files. Maximum batch size is {MAX_BATCH_SIZE}.",
-        )
-
-    if len(files) == 0:
-        raise HTTPException(status_code=400, detail="No files provided.")
+        raise HTTPException(400, f"Max {MAX_BATCH_SIZE} files")
+    if not files:
+        raise HTTPException(400, "No files")
 
     results = []
-
-    for idx, file in enumerate(files):
-        file_start = time.time()
-        filename = file.filename.lower() if file.filename else f"file_{idx}.pdf"
-
+    for f in files:
+        fn = (f.filename or "").lower()
         try:
-            content = await file.read()
-
-            # Validate file size
-            if len(content) > MAX_FILE_SIZE:
-                results.append({
-                    "filename": filename,
-                    "success": False,
-                    "error": f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.",
-                })
+            content = await f.read()
+            if len(content) > MAX_FILE_SIZE or not fn.endswith(".pdf") or not validate_pdf_magic_bytes(content):
+                results.append({"filename": fn, "success": False, "error": "Invalid file"})
                 continue
-
-            # Validate file extension
-            if not filename.endswith(".pdf"):
-                results.append({
-                    "filename": filename,
-                    "success": False,
-                    "error": "Only PDF files are supported.",
-                })
+            cached = response_cache.get(content) if not password else None
+            if cached:
+                results.append({"filename": fn, "success": True, "cached": True, "data": cached})
                 continue
-
-            # Validate PDF magic bytes
-            if not validate_pdf_magic_bytes(content):
-                results.append({
-                    "filename": filename,
-                    "success": False,
-                    "error": "Invalid PDF file.",
-                })
-                continue
-
-            # Check cache
-            cached_result = response_cache.get(content)
-            if cached_result:
-                results.append({
-                    "filename": filename,
-                    "success": True,
-                    "cached": True,
-                    "data": cached_result,
-                })
-                continue
-
-            # Process PDF
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda c=content, f=filename: asyncio.run(
-                    process_single_pdf(c, f, log)
-                ),
-            )
-
-            # Cache result
-            response_cache.set(content, result)
-
-            results.append({
-                "filename": filename,
-                "success": True,
-                "cached": False,
-                "data": result,
-            })
-
-            file_time = time.time() - file_start
-            log.info(f"Processed {filename} in {file_time*1000:.2f}ms")
-
+            data = await asyncio.get_event_loop().run_in_executor(None, lambda c=content, n=fn: asyncio.run(process_pdf(c, n, log, password)))
+            if not password:
+                response_cache.set(content, data)
+            results.append({"filename": fn, "success": True, "cached": False, "data": data})
         except Exception as e:
-            log.error(f"Error processing {filename}: {str(e)}")
-            results.append({
-                "filename": filename,
-                "success": False,
-                "error": str(e),
-            })
+            results.append({"filename": fn, "success": False, "error": str(e)})
 
-    processing_time = time.time() - start_time
-    successful = sum(1 for r in results if r.get("success", False))
-    log.info(
-        f"Batch processing completed: {successful}/{len(files)} successful in {processing_time*1000:.2f}ms"
-    )
+    ok = sum(1 for r in results if r.get("success"))
+    metrics.inc("success" if ok == len(files) else "failed")
+    metrics.observe_time(time.time() - t0)
 
-    metrics.record_request(
-        success=successful == len(files),
-        processing_time=processing_time,
-        cache_hit=False,
-    )
-
-    response_data = {
-        "total": len(files),
-        "successful": successful,
-        "failed": len(files) - successful,
-        "processing_time_ms": round(processing_time * 1000, 2),
-        "results": results,
-    }
-
-    response = JSONResponse(content=response_data)
-    for key, value in request.state.rate_limit_headers.items():
-        response.headers[key] = value
-    return response
+    r = JSONResponse({"total": len(files), "successful": ok, "failed": len(files) - ok, "time_ms": round((time.time() - t0) * 1000, 2), "results": results})
+    for k, v in request.state.rate_limit_headers.items():
+        r.headers[k] = v
+    return r
 
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "service": "Invoice OCR API",
-        "version": "2.1.0",
-    }
+    return {"status": "healthy", "service": "Invoice OCR API", "version": "2.2.0"}
 
 
 @app.get("/health")
-async def health_check():
-    """Detailed health check endpoint."""
+async def health():
     return {
-        "status": "healthy",
-        "service": "Invoice OCR API",
-        "version": "2.1.0",
-        "features": {
-            "authentication": API_KEY is not None,
-            "rate_limiting": True,
-            "caching": True,
-            "batch_processing": True,
-            "multi_currency": True,
-            "confidence_scores": True,
-        },
-        "config": {
-            "max_file_size_mb": MAX_FILE_SIZE // (1024 * 1024),
-            "rate_limit": f"{RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s",
-            "cache_ttl_seconds": CACHE_TTL,
-            "request_timeout_seconds": REQUEST_TIMEOUT,
-            "max_batch_size": MAX_BATCH_SIZE,
-        },
+        "status": "healthy", "version": "2.2.0",
+        "features": {"auth": API_KEY is not None, "rate_limiting": True, "caching": True, "batch": True, "multi_currency": True,
+                     "line_items": True, "export_formats": ["json", "csv", "xml"], "webhooks": True, "pdf_password": True},
+        "config": {"max_file_mb": MAX_FILE_SIZE // 1024 // 1024, "rate_limit": f"{RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s", "timeout": REQUEST_TIMEOUT, "batch_size": MAX_BATCH_SIZE}
     }
 
 
 @app.get("/metrics")
-async def get_metrics(
-    request: Request,
-    _auth: bool = Depends(verify_api_key),
-):
-    """
-    Get API metrics and statistics.
-    Requires authentication if API key is configured.
-    """
-    return {
-        "metrics": metrics.get_metrics(),
-        "cache": response_cache.stats(),
-        "rate_limiter": {
-            "max_requests": RATE_LIMIT_REQUESTS,
-            "window_seconds": RATE_LIMIT_WINDOW,
-            "active_clients": len(rate_limiter.requests),
-        },
-    }
+async def metrics_json(_a: bool = Depends(auth)):
+    return {"metrics": metrics.get(), "cache": response_cache.stats()}
 
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
+@app.get("/metrics/prometheus")
+async def metrics_prom():
+    return PlainTextResponse(metrics.prometheus(), media_type="text/plain")
+
+
+# V1 API routes
+v1.add_api_route("/invoice-to-json", process_invoice, methods=["POST"])
+v1.add_api_route("/invoice-to-json/batch", batch, methods=["POST"])
+v1.add_api_route("/health", health, methods=["GET"])
+v1.add_api_route("/metrics", metrics_json, methods=["GET"])
+app.include_router(v1)
 
 if __name__ == "__main__":
     import uvicorn
-
-    # Get configuration from environment
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    workers = int(os.getenv("WORKERS", "4"))
-
-    print(f"Starting Invoice OCR API on {host}:{port} with {workers} workers")
-
-    uvicorn.run(
-        "working_pdf_extractor:app",
-        host=host,
-        port=port,
-        workers=workers,
-        log_level="info",
-    )
+    uvicorn.run("working_pdf_extractor:app", host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")), workers=int(os.getenv("WORKERS", "4")))

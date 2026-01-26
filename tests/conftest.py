@@ -1,5 +1,5 @@
 """
-Test configuration and fixtures for Invoice OCR API tests.
+Test configuration and fixtures for Invoice OCR API tests (v2.2.0).
 """
 
 import io
@@ -132,22 +132,16 @@ startxref
 def reset_state():
     """Reset global state before each test."""
     # Clear rate limiter
-    rate_limiter.requests.clear()
-    rate_limiter._last_cleanup = 0
+    with rate_limiter._lock:
+        rate_limiter.requests.clear()
 
     # Clear cache
-    response_cache.cache.clear()
+    with response_cache._lock:
+        response_cache.cache.clear()
 
-    # Reset metrics
-    metrics.total_requests = 0
-    metrics.successful_requests = 0
-    metrics.failed_requests = 0
-    metrics.cache_hits = 0
-    metrics.cache_misses = 0
-    metrics.total_processing_time = 0.0
-    metrics.rate_limited_requests = 0
-    metrics.auth_failures = 0
-    metrics.timeout_errors = 0
-    metrics.batch_requests = 0
+    # Reset metrics (v2.2.0 uses _c dict and _times list)
+    with metrics._lock:
+        metrics._c.clear()
+        metrics._times.clear()
 
     yield
