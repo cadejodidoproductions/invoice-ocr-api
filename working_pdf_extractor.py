@@ -1,6 +1,6 @@
 """
 Invoice OCR API - PDF Data Extraction Service
-Version 2.2.0 - Enhanced with line items, multi-currency, export formats, webhooks.
+Version 2.3.0 - OCR support, image formats, validation, async job queue.
 """
 
 import asyncio
@@ -12,7 +12,6 @@ import logging
 import os
 import re
 import secrets
-import signal
 import threading
 import time
 import uuid
@@ -39,6 +38,22 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
+# Optional OCR dependencies
+try:
+    import pytesseract
+    from PIL import Image
+    from pdf2image import convert_from_bytes
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+# Optional Celery for async job queue
+try:
+    from celery import Celery
+    CELERY_AVAILABLE = True
+except ImportError:
+    CELERY_AVAILABLE = False
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -54,6 +69,29 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "10"))
 WEBHOOK_TIMEOUT = int(os.getenv("WEBHOOK_TIMEOUT", "10"))
 JSON_LOGGING = os.getenv("JSON_LOGGING", "false").lower() == "true"
+OCR_ENABLED = os.getenv("OCR_ENABLED", "true").lower() == "true" and OCR_AVAILABLE
+OCR_LANGUAGE = os.getenv("OCR_LANGUAGE", "eng")
+OCR_DPI = int(os.getenv("OCR_DPI", "300"))
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CELERY_ENABLED = os.getenv("CELERY_ENABLED", "false").lower() == "true" and CELERY_AVAILABLE
+
+# =============================================================================
+# CELERY CONFIGURATION (Async Job Queue)
+# =============================================================================
+
+if CELERY_ENABLED:
+    celery_app = Celery("invoice_ocr", broker=REDIS_URL, backend=REDIS_URL)
+    celery_app.conf.update(
+        task_serializer="json",
+        accept_content=["json"],
+        result_serializer="json",
+        timezone="UTC",
+        enable_utc=True,
+        task_track_started=True,
+        result_expires=3600,
+    )
+else:
+    celery_app = None
 
 # =============================================================================
 # JSON STRUCTURED LOGGING
@@ -92,14 +130,69 @@ class RequestIdAdapter(logging.LoggerAdapter):
 logger = logging.getLogger("invoice_ocr")
 
 # =============================================================================
-# PDF VALIDATION
+# FILE VALIDATION
 # =============================================================================
 
 PDF_MAGIC_BYTES = b"%PDF"
+PNG_MAGIC_BYTES = b"\x89PNG"
+JPEG_MAGIC_BYTES = [b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1", b"\xff\xd8\xff\xdb"]
+TIFF_MAGIC_BYTES = [b"II*\x00", b"MM\x00*"]
+
+SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif"}
+SUPPORTED_MIMETYPES = {
+    "application/pdf": "pdf",
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/tiff": "tiff",
+}
 
 
-def validate_pdf_magic_bytes(content: bytes) -> bool:
-    return content[:4] == PDF_MAGIC_BYTES
+def detect_file_type(content: bytes, filename: str) -> str:
+    """Detect file type from magic bytes and extension."""
+    ext = os.path.splitext(filename.lower())[1]
+
+    # Check magic bytes
+    if content[:4] == PDF_MAGIC_BYTES:
+        return "pdf"
+    if content[:4] == PNG_MAGIC_BYTES:
+        return "png"
+    for magic in JPEG_MAGIC_BYTES:
+        if content[:4] == magic:
+            return "jpg"
+    for magic in TIFF_MAGIC_BYTES:
+        if content[:4] == magic:
+            return "tiff"
+
+    # Fallback to extension
+    if ext in {".jpg", ".jpeg"}:
+        return "jpg"
+    if ext == ".png":
+        return "png"
+    if ext in {".tif", ".tiff"}:
+        return "tiff"
+    if ext == ".pdf":
+        return "pdf"
+
+    return "unknown"
+
+
+def validate_file(content: bytes, filename: str) -> tuple[bool, str, str]:
+    """Validate file and return (valid, file_type, error_message)."""
+    ext = os.path.splitext(filename.lower())[1]
+
+    if ext not in SUPPORTED_EXTENSIONS:
+        return False, "unknown", f"Unsupported format. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
+
+    file_type = detect_file_type(content, filename)
+
+    if file_type == "unknown":
+        return False, "unknown", "Could not detect file type from content"
+
+    # For images, require OCR to be available
+    if file_type in {"png", "jpg", "tiff"} and not OCR_AVAILABLE:
+        return False, file_type, "Image processing requires OCR dependencies (pytesseract, Pillow, pdf2image)"
+
+    return True, file_type, ""
 
 
 # =============================================================================
@@ -130,7 +223,6 @@ DUE_DATE_PATTERNS = [
     re.compile(r"(?:Due|Payable)[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})", re.IGNORECASE),
 ]
 
-# Multi-currency patterns (expanded)
 CURRENCY_PATTERNS = [
     (re.compile(r"\$\s*([\d,]+(?:\.\d{2})?)"), "USD", "$"),
     (re.compile(r"USD\s*([\d,]+(?:\.\d{2})?)"), "USD", "USD"),
@@ -236,7 +328,60 @@ class ResponseCache:
 response_cache = ResponseCache(CACHE_MAX_SIZE, CACHE_TTL)
 
 # =============================================================================
-# METRICS (with Prometheus export)
+# JOB STORE (for async processing)
+# =============================================================================
+
+
+class JobStore:
+    """Simple in-memory job store for async processing status."""
+
+    def __init__(self):
+        self._jobs: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def create(self, job_id: str) -> dict:
+        job = {
+            "id": job_id,
+            "status": "pending",
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+            "result": None,
+            "error": None,
+        }
+        with self._lock:
+            self._jobs[job_id] = job
+        return job
+
+    def update(self, job_id: str, status: str, result: dict = None, error: str = None):
+        with self._lock:
+            if job_id in self._jobs:
+                self._jobs[job_id]["status"] = status
+                self._jobs[job_id]["updated_at"] = datetime.utcnow().isoformat()
+                if result:
+                    self._jobs[job_id]["result"] = result
+                if error:
+                    self._jobs[job_id]["error"] = error
+
+    def get(self, job_id: str) -> Optional[dict]:
+        with self._lock:
+            return self._jobs.get(job_id, {}).copy() if job_id in self._jobs else None
+
+    def cleanup_old(self, max_age_seconds: int = 3600):
+        """Remove jobs older than max_age_seconds."""
+        cutoff = datetime.utcnow().timestamp() - max_age_seconds
+        with self._lock:
+            to_remove = [
+                jid for jid, job in self._jobs.items()
+                if datetime.fromisoformat(job["created_at"]).timestamp() < cutoff
+            ]
+            for jid in to_remove:
+                del self._jobs[jid]
+
+
+job_store = JobStore()
+
+# =============================================================================
+# METRICS
 # =============================================================================
 
 
@@ -271,6 +416,9 @@ class MetricsCollector:
                 "auth_failures": self._c["auth_fail"],
                 "timeouts": self._c["timeout"],
                 "webhooks_sent": self._c["webhook"],
+                "ocr_processed": self._c["ocr"],
+                "validation_errors": self._c["validation_error"],
+                "async_jobs": self._c["async_job"],
                 "avg_time_ms": round(avg * 1000, 2),
             }
 
@@ -288,6 +436,9 @@ class MetricsCollector:
             f"invoice_ocr_cache_hits {m['cache_hits']}",
             f"invoice_ocr_cache_misses {m['cache_misses']}",
             f"invoice_ocr_rate_limited {m['rate_limited']}",
+            f"invoice_ocr_ocr_processed {m['ocr_processed']}",
+            f"invoice_ocr_validation_errors {m['validation_errors']}",
+            f"invoice_ocr_async_jobs {m['async_jobs']}",
             f"invoice_ocr_avg_time_ms {m['avg_time_ms']}",
         ]
         return "\n".join(lines) + "\n"
@@ -421,31 +572,248 @@ def extract_invoice_data(text: str, log: RequestIdAdapter) -> dict:
 
 
 # =============================================================================
-# PDF PROCESSING
+# INVOICE VALIDATION
 # =============================================================================
 
 
-async def process_pdf(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None) -> dict:
-    if not validate_pdf_magic_bytes(content):
-        raise ValueError("Invalid PDF: bad magic bytes")
+def validate_invoice_data(data: dict) -> dict:
+    """Validate extracted invoice data and return validation results."""
+    errors = []
+    warnings = []
 
-    pdf = io.BytesIO(content)
-    try:
-        reader = pypdf.PdfReader(pdf, password=password) if password else pypdf.PdfReader(pdf)
-        if reader.is_encrypted and not password:
-            raise ValueError("PDF is encrypted. Provide password.")
-    except pypdf.errors.FileNotDecryptedError:
-        raise ValueError("PDF encrypted. Wrong password.")
+    # Required field validation
+    if data.get("vendor") == "Unknown":
+        warnings.append("Vendor name could not be extracted")
+    if data.get("invoice_no") == "N/A":
+        warnings.append("Invoice number could not be extracted")
+    if data.get("date") == "N/A":
+        warnings.append("Invoice date could not be extracted")
+    if data.get("total") is None:
+        errors.append("Total amount could not be extracted")
 
-    text = "\n".join(p.extract_text() or "" for p in reader.pages)
+    # Math validation
+    subtotal = data.get("subtotal") or 0
+    tax = data.get("tax") or 0
+    shipping = data.get("shipping") or 0
+    discount = data.get("discount") or 0
+    total = data.get("total") or 0
+
+    if subtotal > 0 and total > 0:
+        expected_total = subtotal + tax + shipping - discount
+        tolerance = 0.02  # 2 cents tolerance for rounding
+        if abs(expected_total - total) > tolerance:
+            warnings.append(f"Math validation: subtotal({subtotal}) + tax({tax}) + shipping({shipping}) - discount({discount}) = {expected_total}, but total is {total}")
+
+    # Line items validation
+    if data.get("line_items"):
+        line_total = sum(item.get("amount", 0) for item in data["line_items"])
+        if subtotal > 0 and abs(line_total - subtotal) > 0.02:
+            warnings.append(f"Line items sum ({line_total}) doesn't match subtotal ({subtotal})")
+
+        for i, item in enumerate(data["line_items"]):
+            qty = item.get("quantity", 0)
+            unit_price = item.get("unit_price", 0)
+            amount = item.get("amount", 0)
+            if qty > 0 and unit_price > 0:
+                expected = qty * unit_price
+                if abs(expected - amount) > 0.02:
+                    warnings.append(f"Line item {i+1}: qty({qty}) x unit_price({unit_price}) = {expected}, but amount is {amount}")
+
+    # Date validation
+    date_str = data.get("date", "N/A")
+    if date_str != "N/A":
+        try:
+            # Try to parse various date formats
+            parsed = None
+            for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%B %d, %Y", "%b %d, %Y", "%d.%m.%Y"]:
+                try:
+                    parsed = datetime.strptime(date_str, fmt)
+                    break
+                except ValueError:
+                    continue
+
+            if parsed:
+                # Check if date is in reasonable range (not more than 1 year in future or 10 years in past)
+                now = datetime.now()
+                if parsed > now.replace(year=now.year + 1):
+                    warnings.append(f"Invoice date {date_str} is more than 1 year in the future")
+                elif parsed < now.replace(year=now.year - 10):
+                    warnings.append(f"Invoice date {date_str} is more than 10 years old")
+        except Exception:
+            pass  # Date parsing failed, skip validation
+
+    # Confidence validation
+    confidence = data.get("confidence", {})
+    if confidence.get("overall", 0) < 0.5:
+        warnings.append("Overall extraction confidence is low (<50%)")
+
+    is_valid = len(errors) == 0
+
+    return {
+        "is_valid": is_valid,
+        "errors": errors,
+        "warnings": warnings,
+        "checks_passed": 5 - len(errors) - (1 if warnings else 0),
+        "total_checks": 5,
+    }
+
+
+# =============================================================================
+# OCR FUNCTIONS
+# =============================================================================
+
+
+def ocr_image(image: "Image.Image", language: str = "eng") -> str:
+    """Extract text from an image using Tesseract OCR."""
+    if not OCR_AVAILABLE:
+        raise ValueError("OCR not available. Install pytesseract and Pillow.")
+
+    # Preprocess image for better OCR
+    # Convert to grayscale
+    if image.mode != "L":
+        image = image.convert("L")
+
+    # Apply OCR
+    text = pytesseract.image_to_string(image, lang=language, config="--psm 6")
+    return text
+
+
+def ocr_pdf_pages(content: bytes, dpi: int = 300, language: str = "eng") -> str:
+    """Convert PDF pages to images and extract text using OCR."""
+    if not OCR_AVAILABLE:
+        raise ValueError("OCR not available. Install pytesseract, Pillow, and pdf2image.")
+
+    # Convert PDF to images
+    images = convert_from_bytes(content, dpi=dpi)
+
+    # Extract text from each page
+    texts = []
+    for i, image in enumerate(images):
+        text = ocr_image(image, language)
+        texts.append(text)
+
+    return "\n\n".join(texts)
+
+
+def process_image_file(content: bytes, filename: str, log: RequestIdAdapter) -> str:
+    """Process an image file and extract text using OCR."""
+    if not OCR_AVAILABLE:
+        raise ValueError("OCR not available. Install pytesseract and Pillow.")
+
+    image = Image.open(io.BytesIO(content))
+    log.info(f"Processing image: {filename}, size={image.size}, mode={image.mode}")
+
+    text = ocr_image(image, OCR_LANGUAGE)
+    return text
+
+
+# =============================================================================
+# DOCUMENT PROCESSING
+# =============================================================================
+
+
+def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True) -> dict:
+    """Process a document (PDF or image) and extract invoice data."""
+    valid, file_type, error = validate_file(content, filename)
+    if not valid:
+        raise ValueError(error)
+
+    text = ""
+    ocr_used = False
+    pages = 1
+
+    if file_type == "pdf":
+        # Try text extraction first
+        pdf = io.BytesIO(content)
+        try:
+            reader = pypdf.PdfReader(pdf, password=password) if password else pypdf.PdfReader(pdf)
+            if reader.is_encrypted and not password:
+                raise ValueError("PDF is encrypted. Provide password.")
+        except pypdf.errors.FileNotDecryptedError:
+            raise ValueError("PDF encrypted. Wrong password.")
+
+        text = "\n".join(p.extract_text() or "" for p in reader.pages)
+        pages = len(reader.pages)
+
+        # If no text extracted and OCR is enabled, use OCR
+        if not text.strip() and use_ocr and OCR_ENABLED:
+            log.info("No text in PDF, attempting OCR")
+            text = ocr_pdf_pages(content, OCR_DPI, OCR_LANGUAGE)
+            ocr_used = True
+            metrics.inc("ocr")
+
+    elif file_type in {"png", "jpg", "tiff"}:
+        # Image files always require OCR
+        if not OCR_ENABLED:
+            raise ValueError("Image processing requires OCR to be enabled")
+
+        text = process_image_file(content, filename, log)
+        ocr_used = True
+        metrics.inc("ocr")
+
     if not text.strip():
-        raise ValueError("No text extracted. PDF may be scanned.")
+        raise ValueError("No text could be extracted from the document")
 
     result = extract_invoice_data(text, log)
-    result["file_type"] = "PDF"
-    result["pages"] = len(reader.pages)
+    result["file_type"] = file_type.upper()
+    result["pages"] = pages
     result["filename"] = filename
+    result["ocr_used"] = ocr_used
+
+    # Add validation
+    validation = validate_invoice_data(result)
+    result["validation"] = validation
+
+    if validation["errors"]:
+        metrics.inc("validation_error")
+
     return result
+
+
+async def process_document(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True) -> dict:
+    """Async wrapper for document processing."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: process_document_sync(content, filename, log, password, use_ocr)
+    )
+
+
+# =============================================================================
+# CELERY TASKS
+# =============================================================================
+
+if CELERY_ENABLED:
+    @celery_app.task(bind=True)
+    def process_document_task(self, content_b64: str, filename: str, password: Optional[str] = None, use_ocr: bool = True, webhook_url: Optional[str] = None):
+        """Celery task for async document processing."""
+        import base64
+
+        content = base64.b64decode(content_b64)
+        log = RequestIdAdapter(logger, {"request_id": self.request.id})
+
+        try:
+            job_store.update(self.request.id, "processing")
+            result = process_document_sync(content, filename, log, password, use_ocr)
+            job_store.update(self.request.id, "completed", result=result)
+
+            # Send webhook if configured
+            if webhook_url:
+                import requests
+                try:
+                    requests.post(webhook_url, json={
+                        "job_id": self.request.id,
+                        "status": "completed",
+                        "data": result,
+                        "ts": datetime.utcnow().isoformat(),
+                    }, timeout=WEBHOOK_TIMEOUT)
+                except Exception:
+                    pass
+
+            return result
+        except Exception as e:
+            job_store.update(self.request.id, "failed", error=str(e))
+            raise
 
 
 # =============================================================================
@@ -503,12 +871,12 @@ shutdown_event = asyncio.Event()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting Invoice OCR API v2.2.0")
+    logger.info(f"Starting Invoice OCR API v2.3.0 (OCR={'enabled' if OCR_ENABLED else 'disabled'}, Celery={'enabled' if CELERY_ENABLED else 'disabled'})")
     yield
     logger.info("Shutting down")
 
 
-app = FastAPI(title="Invoice OCR API", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="Invoice OCR API", version="2.3.0", lifespan=lifespan)
 v1 = APIRouter(prefix="/v1", tags=["v1"])
 
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -555,11 +923,13 @@ async def process_invoice(
     file: UploadFile = File(...),
     password: Optional[str] = Form(None),
     webhook_url: Optional[str] = Form(None),
-    export: Optional[str] = Query(None, regex="^(json|csv|xml)$"),
+    use_ocr: Optional[bool] = Form(True),
+    validate: Optional[bool] = Form(True),
+    export: Optional[str] = Query(None, pattern="^(json|csv|xml)$"),
     _a: bool = Depends(auth),
     _r: bool = Depends(rate_limit),
 ):
-    """Extract data from PDF invoice. Supports password-protected PDFs, webhooks, and export formats."""
+    """Extract data from invoice document (PDF, PNG, JPG, TIFF). Supports OCR for scanned documents."""
     t0 = time.time()
     log = get_log(request)
     metrics.inc("requests")
@@ -570,13 +940,14 @@ async def process_invoice(
         metrics.inc("timeout")
         raise HTTPException(408, "Timeout")
 
-    fn = (file.filename or "").lower()
+    fn = file.filename or "document"
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(413, "File too large")
-    if not fn.endswith(".pdf"):
-        raise HTTPException(400, "Only PDF supported")
-    if not validate_pdf_magic_bytes(content):
-        raise HTTPException(400, "Invalid PDF")
+
+    # Validate file type
+    valid, file_type, error = validate_file(content, fn)
+    if not valid:
+        raise HTTPException(400, error)
 
     cached = response_cache.get(content) if not password else None
     if cached:
@@ -589,7 +960,7 @@ async def process_invoice(
     metrics.inc("cache_miss")
     try:
         result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, lambda: asyncio.run(process_pdf(content, fn, log, password))),
+            process_document(content, fn, log, password, use_ocr and OCR_ENABLED),
             REQUEST_TIMEOUT
         )
     except asyncio.TimeoutError:
@@ -611,6 +982,87 @@ async def process_invoice(
     return _resp(result, export, request, False)
 
 
+@app.post("/invoice-to-json/async")
+async def process_invoice_async(
+    request: Request,
+    file: UploadFile = File(...),
+    password: Optional[str] = Form(None),
+    webhook_url: Optional[str] = Form(None),
+    use_ocr: Optional[bool] = Form(True),
+    _a: bool = Depends(auth),
+    _r: bool = Depends(rate_limit),
+):
+    """Submit invoice for async processing. Returns job ID for status polling."""
+    log = get_log(request)
+    metrics.inc("requests")
+    metrics.inc("async_job")
+
+    try:
+        content = await asyncio.wait_for(file.read(), REQUEST_TIMEOUT)
+    except asyncio.TimeoutError:
+        metrics.inc("timeout")
+        raise HTTPException(408, "Timeout")
+
+    fn = file.filename or "document"
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, "File too large")
+
+    valid, file_type, error = validate_file(content, fn)
+    if not valid:
+        raise HTTPException(400, error)
+
+    job_id = str(uuid.uuid4())
+
+    if CELERY_ENABLED:
+        # Use Celery for distributed processing
+        import base64
+        content_b64 = base64.b64encode(content).decode()
+        task = process_document_task.apply_async(
+            args=[content_b64, fn, password, use_ocr and OCR_ENABLED, webhook_url],
+            task_id=job_id,
+        )
+        job_store.create(job_id)
+    else:
+        # Use background task for simple async processing
+        job_store.create(job_id)
+
+        async def process_bg():
+            try:
+                job_store.update(job_id, "processing")
+                result = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED)
+                job_store.update(job_id, "completed", result=result)
+                metrics.inc("success")
+
+                if webhook_url:
+                    await send_webhook(webhook_url, {"job_id": job_id, "status": "completed", "data": result}, job_id)
+            except Exception as e:
+                job_store.update(job_id, "failed", error=str(e))
+                metrics.inc("failed")
+
+                if webhook_url:
+                    await send_webhook(webhook_url, {"job_id": job_id, "status": "failed", "error": str(e)}, job_id)
+
+        asyncio.create_task(process_bg())
+
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "pending",
+        "status_url": f"/jobs/{job_id}",
+        "message": "Document submitted for processing",
+    }, headers=dict(request.state.rate_limit_headers))
+
+
+@app.get("/jobs/{job_id}")
+async def get_job_status(job_id: str, _a: bool = Depends(auth)):
+    """Get status of an async processing job."""
+    job = job_store.get(job_id)
+
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    return JSONResponse(job)
+
+
 def _resp(data: dict, fmt: Optional[str], request: Request, cached: bool) -> Response:
     hdrs = dict(request.state.rate_limit_headers)
     if fmt == "csv":
@@ -624,8 +1076,8 @@ def _resp(data: dict, fmt: Optional[str], request: Request, cached: bool) -> Res
 
 
 @app.post("/invoice-to-json/batch")
-async def batch(request: Request, files: list[UploadFile] = File(...), password: Optional[str] = Form(None), _a: bool = Depends(auth), _r: bool = Depends(rate_limit)):
-    """Process multiple PDFs in one request."""
+async def batch(request: Request, files: list[UploadFile] = File(...), password: Optional[str] = Form(None), use_ocr: Optional[bool] = Form(True), _a: bool = Depends(auth), _r: bool = Depends(rate_limit)):
+    """Process multiple documents in one request."""
     t0 = time.time()
     log = get_log(request)
     metrics.inc("requests")
@@ -637,17 +1089,24 @@ async def batch(request: Request, files: list[UploadFile] = File(...), password:
 
     results = []
     for f in files:
-        fn = (f.filename or "").lower()
+        fn = f.filename or "document"
         try:
             content = await f.read()
-            if len(content) > MAX_FILE_SIZE or not fn.endswith(".pdf") or not validate_pdf_magic_bytes(content):
-                results.append({"filename": fn, "success": False, "error": "Invalid file"})
+            if len(content) > MAX_FILE_SIZE:
+                results.append({"filename": fn, "success": False, "error": "File too large"})
                 continue
+
+            valid, file_type, error = validate_file(content, fn)
+            if not valid:
+                results.append({"filename": fn, "success": False, "error": error})
+                continue
+
             cached = response_cache.get(content) if not password else None
             if cached:
                 results.append({"filename": fn, "success": True, "cached": True, "data": cached})
                 continue
-            data = await asyncio.get_event_loop().run_in_executor(None, lambda c=content, n=fn: asyncio.run(process_pdf(c, n, log, password)))
+
+            data = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED)
             if not password:
                 response_cache.set(content, data)
             results.append({"filename": fn, "success": True, "cached": False, "data": data})
@@ -666,16 +1125,37 @@ async def batch(request: Request, files: list[UploadFile] = File(...), password:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "Invoice OCR API", "version": "2.2.0"}
+    return {"status": "healthy", "service": "Invoice OCR API", "version": "2.3.0"}
 
 
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy", "version": "2.2.0",
-        "features": {"auth": API_KEY is not None, "rate_limiting": True, "caching": True, "batch": True, "multi_currency": True,
-                     "line_items": True, "export_formats": ["json", "csv", "xml"], "webhooks": True, "pdf_password": True},
-        "config": {"max_file_mb": MAX_FILE_SIZE // 1024 // 1024, "rate_limit": f"{RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s", "timeout": REQUEST_TIMEOUT, "batch_size": MAX_BATCH_SIZE}
+        "status": "healthy", "version": "2.3.0",
+        "features": {
+            "auth": API_KEY is not None,
+            "rate_limiting": True,
+            "caching": True,
+            "batch": True,
+            "multi_currency": True,
+            "line_items": True,
+            "export_formats": ["json", "csv", "xml"],
+            "webhooks": True,
+            "pdf_password": True,
+            "ocr": OCR_ENABLED,
+            "image_formats": ["png", "jpg", "tiff"] if OCR_ENABLED else [],
+            "async_processing": True,
+            "celery": CELERY_ENABLED,
+            "validation": True,
+        },
+        "config": {
+            "max_file_mb": MAX_FILE_SIZE // 1024 // 1024,
+            "rate_limit": f"{RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s",
+            "timeout": REQUEST_TIMEOUT,
+            "batch_size": MAX_BATCH_SIZE,
+            "ocr_language": OCR_LANGUAGE if OCR_ENABLED else None,
+            "ocr_dpi": OCR_DPI if OCR_ENABLED else None,
+        }
     }
 
 
@@ -691,7 +1171,9 @@ async def metrics_prom():
 
 # V1 API routes
 v1.add_api_route("/invoice-to-json", process_invoice, methods=["POST"])
+v1.add_api_route("/invoice-to-json/async", process_invoice_async, methods=["POST"])
 v1.add_api_route("/invoice-to-json/batch", batch, methods=["POST"])
+v1.add_api_route("/jobs/{job_id}", get_job_status, methods=["GET"])
 v1.add_api_route("/health", health, methods=["GET"])
 v1.add_api_route("/metrics", metrics_json, methods=["GET"])
 app.include_router(v1)

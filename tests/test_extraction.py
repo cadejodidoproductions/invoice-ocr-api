@@ -1,5 +1,5 @@
 """
-Tests for invoice data extraction logic (v2.2.0).
+Tests for invoice data extraction logic (v2.3.0).
 """
 
 import pytest
@@ -7,7 +7,8 @@ from unittest.mock import MagicMock
 
 # Import extraction functions
 from working_pdf_extractor import (
-    validate_pdf_magic_bytes,
+    validate_file,
+    detect_file_type,
     extract_vendor,
     extract_invoice_number,
     extract_po_number,
@@ -17,6 +18,7 @@ from working_pdf_extractor import (
     extract_line_items,
     extract_addresses,
     extract_invoice_data,
+    validate_invoice_data,
     parse_amount,
     to_csv,
     to_xml,
@@ -24,27 +26,48 @@ from working_pdf_extractor import (
 )
 
 
-class TestPdfValidation:
-    """Tests for PDF magic bytes validation."""
+class TestFileValidation:
+    """Tests for file validation."""
 
-    def test_valid_pdf_magic_bytes(self):
-        """Test validation of valid PDF magic bytes."""
+    def test_valid_pdf_file(self):
+        """Test validation of valid PDF file."""
         content = b"%PDF-1.4 rest of content..."
-        assert validate_pdf_magic_bytes(content) is True
+        valid, file_type, error = validate_file(content, "invoice.pdf")
+        assert valid is True
+        assert file_type == "pdf"
 
-    def test_invalid_pdf_magic_bytes(self):
-        """Test validation of invalid magic bytes."""
+    def test_invalid_pdf_content(self):
+        """Test validation of invalid content."""
         content = b"Not a PDF file"
-        assert validate_pdf_magic_bytes(content) is False
+        valid, file_type, error = validate_file(content, "invoice.pdf")
+        assert valid is False
 
-    def test_empty_content(self):
-        """Test validation of empty content."""
-        assert validate_pdf_magic_bytes(b"") is False
+    def test_unsupported_extension(self):
+        """Test validation of unsupported file extension."""
+        content = b"%PDF-1.4"
+        valid, file_type, error = validate_file(content, "document.doc")
+        assert valid is False
+        assert "Unsupported" in error
 
-    def test_partial_magic_bytes(self):
-        """Test validation of partial magic bytes."""
-        assert validate_pdf_magic_bytes(b"%PD") is False
-        assert validate_pdf_magic_bytes(b"%PDF") is True
+    def test_detect_pdf_type(self):
+        """Test file type detection for PDF."""
+        content = b"%PDF-1.4 content"
+        assert detect_file_type(content, "test.pdf") == "pdf"
+
+    def test_detect_png_type(self):
+        """Test file type detection for PNG."""
+        content = b"\x89PNG\r\n\x1a\n rest"
+        assert detect_file_type(content, "test.png") == "png"
+
+    def test_detect_jpg_type(self):
+        """Test file type detection for JPEG."""
+        content = b"\xff\xd8\xff\xe0 rest"
+        assert detect_file_type(content, "test.jpg") == "jpg"
+
+    def test_detect_unknown_type(self):
+        """Test file type detection for unknown content."""
+        content = b"unknown content"
+        assert detect_file_type(content, "unknown.xyz") == "unknown"
 
 
 class TestVendorExtraction:
@@ -379,6 +402,79 @@ class TestExportFunctions:
         xml_output = to_xml(data)
         assert "<vendor>ACME Corp</vendor>" in xml_output
         assert "<invoice_no>INV-001</invoice_no>" in xml_output
+
+
+class TestInvoiceValidation:
+    """Tests for invoice data validation."""
+
+    def test_valid_invoice_passes(self):
+        """Test that valid invoice data passes validation."""
+        data = {
+            "vendor": "ACME Corp",
+            "invoice_no": "INV-001",
+            "date": "2024-01-15",
+            "subtotal": 100.00,
+            "tax": 10.00,
+            "total": 110.00,
+            "line_items": [],
+            "confidence": {"overall": 0.85},
+        }
+        result = validate_invoice_data(data)
+        assert result["is_valid"] is True
+        assert len(result["errors"]) == 0
+
+    def test_missing_total_is_error(self):
+        """Test that missing total is an error."""
+        data = {
+            "vendor": "ACME Corp",
+            "invoice_no": "INV-001",
+            "date": "2024-01-15",
+            "total": None,
+            "confidence": {"overall": 0.85},
+        }
+        result = validate_invoice_data(data)
+        assert result["is_valid"] is False
+        assert any("Total" in e for e in result["errors"])
+
+    def test_unknown_vendor_is_warning(self):
+        """Test that unknown vendor generates warning."""
+        data = {
+            "vendor": "Unknown",
+            "invoice_no": "INV-001",
+            "date": "2024-01-15",
+            "total": 100.00,
+            "confidence": {"overall": 0.85},
+        }
+        result = validate_invoice_data(data)
+        assert any("Vendor" in w for w in result["warnings"])
+
+    def test_math_validation(self):
+        """Test math validation (subtotal + tax = total)."""
+        data = {
+            "vendor": "ACME Corp",
+            "invoice_no": "INV-001",
+            "date": "2024-01-15",
+            "subtotal": 100.00,
+            "tax": 10.00,
+            "shipping": 0,
+            "discount": 0,
+            "total": 200.00,  # Wrong total
+            "confidence": {"overall": 0.85},
+        }
+        result = validate_invoice_data(data)
+        assert any("Math" in w for w in result["warnings"])
+
+    def test_low_confidence_warning(self):
+        """Test that low confidence generates warning."""
+        data = {
+            "vendor": "ACME Corp",
+            "invoice_no": "INV-001",
+            "date": "2024-01-15",
+            "total": 100.00,
+            "confidence": {"overall": 0.3},
+        }
+        result = validate_invoice_data(data)
+        assert any("confidence" in w.lower() for w in result["warnings"])
 
 
 class TestFullExtraction:

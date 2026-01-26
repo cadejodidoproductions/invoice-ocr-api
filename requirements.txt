@@ -12,3 +12,17 @@ python-multipart>=0.0.6
 
 # HTTP Client (for webhooks and external API calls)
 httpx>=0.24.0
+
+# =============================================================================
+# Optional: OCR Support (requires system dependencies)
+# Install Tesseract: apt-get install tesseract-ocr
+# Install Poppler: apt-get install poppler-utils
+# =============================================================================
+pytesseract>=0.3.10
+Pillow>=10.0.0
+pdf2image>=1.16.0
+
+# =============================================================================
+# Optional: Distributed Job Queue (requires Redis)
+# =============================================================================
+celery[redis]>=5.3.0

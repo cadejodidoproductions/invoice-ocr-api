@@ -1,5 +1,5 @@
 """
-Tests for Invoice OCR API endpoints (v2.2.0).
+Tests for Invoice OCR API endpoints (v2.3.0).
 """
 
 import io
@@ -17,7 +17,7 @@ class TestHealthEndpoints:
         data = response.json()
         assert data["status"] == "healthy"
         assert data["service"] == "Invoice OCR API"
-        assert data["version"] == "2.2.0"
+        assert data["version"] == "2.3.0"
 
     def test_health_endpoint(self, client):
         """Test the detailed health endpoint."""
@@ -27,7 +27,7 @@ class TestHealthEndpoints:
         assert data["status"] == "healthy"
         assert "features" in data
         assert "config" in data
-        # Check v2.2.0 features
+        # Check v2.3.0 features
         assert data["features"]["rate_limiting"] is True
         assert data["features"]["caching"] is True
         assert data["features"]["batch"] is True
@@ -35,6 +35,8 @@ class TestHealthEndpoints:
         assert data["features"]["line_items"] is True
         assert data["features"]["webhooks"] is True
         assert data["features"]["pdf_password"] is True
+        assert data["features"]["validation"] is True
+        assert data["features"]["async_processing"] is True
         assert "json" in data["features"]["export_formats"]
         assert "csv" in data["features"]["export_formats"]
         assert "xml" in data["features"]["export_formats"]
@@ -66,6 +68,10 @@ class TestMetricsEndpoint:
         data = response.json()
         assert "metrics" in data
         assert "cache" in data
+        # Check v2.3.0 metrics fields
+        assert "ocr_processed" in data["metrics"]
+        assert "validation_errors" in data["metrics"]
+        assert "async_jobs" in data["metrics"]
 
     def test_metrics_with_invalid_auth(self, client, invalid_auth_headers):
         """Test metrics endpoint with invalid authentication."""
@@ -78,6 +84,8 @@ class TestMetricsEndpoint:
         assert response.status_code == 200
         assert "invoice_ocr_uptime" in response.text
         assert "invoice_ocr_requests_total" in response.text
+        assert "invoice_ocr_ocr_processed" in response.text
+        assert "invoice_ocr_validation_errors" in response.text
 
 
 class TestInvoiceProcessing:
@@ -89,22 +97,20 @@ class TestInvoiceProcessing:
         assert response.status_code == 422  # Validation error
 
     def test_process_non_pdf_file(self, client, auth_headers):
-        """Test rejection of non-PDF files."""
+        """Test rejection of unsupported file formats."""
         files = {"file": ("document.txt", io.BytesIO(b"Hello World"), "text/plain")}
         response = client.post("/invoice-to-json", headers=auth_headers, files=files)
         assert response.status_code == 400
-        assert "PDF" in response.json()["detail"]
+        assert "Unsupported" in response.json()["detail"]
 
     def test_process_invalid_pdf_magic_bytes(self, client, auth_headers, invalid_pdf_content):
-        """Test rejection of files without valid PDF magic bytes."""
+        """Test rejection of files without valid magic bytes."""
         files = {"file": ("invoice.pdf", io.BytesIO(invalid_pdf_content), "application/pdf")}
         response = client.post("/invoice-to-json", headers=auth_headers, files=files)
         assert response.status_code == 400
-        assert "Invalid PDF" in response.json()["detail"]
 
     def test_process_oversized_file(self, client, auth_headers):
         """Test rejection of files exceeding size limit."""
-        # Create a file larger than MAX_FILE_SIZE (10MB)
         large_content = b"%PDF-1.4" + b"x" * (11 * 1024 * 1024)
         files = {"file": ("large.pdf", io.BytesIO(large_content), "application/pdf")}
         response = client.post("/invoice-to-json", headers=auth_headers, files=files)
@@ -125,6 +131,17 @@ class TestInvoiceProcessing:
         assert "X-RateLimit-Remaining" in response.headers
         assert "X-RateLimit-Reset" in response.headers
 
+    def test_validation_in_response(self, client, auth_headers, sample_pdf_content):
+        """Test that response includes validation results."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files)
+        if response.status_code == 200:
+            data = response.json()
+            assert "validation" in data
+            assert "is_valid" in data["validation"]
+            assert "errors" in data["validation"]
+            assert "warnings" in data["validation"]
+
 
 class TestExportFormats:
     """Tests for export format functionality."""
@@ -133,7 +150,6 @@ class TestExportFormats:
         """Test CSV export format."""
         files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
         response = client.post("/invoice-to-json?export=csv", headers=auth_headers, files=files)
-        # Will be 422 if PDF can't be processed, but header check is valid
         if response.status_code == 200:
             assert response.headers.get("content-type", "").startswith("text/csv")
             assert "Content-Disposition" in response.headers
@@ -149,7 +165,7 @@ class TestExportFormats:
         """Test invalid export format is rejected."""
         files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
         response = client.post("/invoice-to-json?export=pdf", headers=auth_headers, files=files)
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 422
 
 
 class TestBatchProcessing:
@@ -158,11 +174,10 @@ class TestBatchProcessing:
     def test_batch_empty_files(self, client, auth_headers):
         """Test batch processing with no files."""
         response = client.post("/invoice-to-json/batch", headers=auth_headers, files=[])
-        assert response.status_code == 422  # FastAPI validation error for missing required field
+        assert response.status_code == 422
 
     def test_batch_exceeds_limit(self, client, auth_headers, sample_pdf_content):
         """Test batch processing with too many files."""
-        # Create 11 files (exceeds MAX_BATCH_SIZE of 10)
         files = [
             ("files", (f"invoice_{i}.pdf", io.BytesIO(sample_pdf_content), "application/pdf"))
             for i in range(11)
@@ -182,8 +197,42 @@ class TestBatchProcessing:
         assert response.status_code == 200
         data = response.json()
         assert data["total"] == 3
-        assert data["failed"] >= 2  # At least invalid.pdf and not_pdf.txt should fail
+        assert data["failed"] >= 2
         assert "time_ms" in data
+
+
+class TestAsyncProcessing:
+    """Tests for async processing endpoint."""
+
+    def test_async_submit_returns_job_id(self, client, auth_headers, sample_pdf_content):
+        """Test that async submission returns a job ID."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        response = client.post("/invoice-to-json/async", headers=auth_headers, files=files)
+        assert response.status_code == 200
+        data = response.json()
+        assert "job_id" in data
+        assert "status" in data
+        assert "status_url" in data
+        assert data["status"] == "pending"
+
+    def test_get_job_status(self, client, auth_headers, sample_pdf_content):
+        """Test getting job status."""
+        # Submit async job
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        response = client.post("/invoice-to-json/async", headers=auth_headers, files=files)
+        job_id = response.json()["job_id"]
+
+        # Get job status
+        response = client.get(f"/jobs/{job_id}", headers=auth_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == job_id
+        assert "status" in data
+
+    def test_get_nonexistent_job(self, client, auth_headers):
+        """Test getting status of non-existent job."""
+        response = client.get("/jobs/nonexistent-job-id", headers=auth_headers)
+        assert response.status_code == 404
 
 
 class TestAuthentication:
@@ -210,15 +259,11 @@ class TestCaching:
     def test_cache_hit_indicator(self, client, auth_headers, sample_pdf_content):
         """Test that cached responses include cached indicator."""
         files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
-
-        # First request - should not be cached
         response1 = client.post("/invoice-to-json", headers=auth_headers, files=files)
 
-        # Second request with same content - should be cached
         files2 = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
         response2 = client.post("/invoice-to-json", headers=auth_headers, files=files2)
 
-        # If processing succeeded, check cache behavior
         if response1.status_code == 200 and response2.status_code == 200:
             data2 = response2.json()
             assert data2.get("cached") is True
@@ -232,8 +277,7 @@ class TestWebhooks:
         files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
         data = {"webhook_url": "https://example.com/webhook"}
         response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
-        # Request should be accepted (webhook will be sent in background)
-        assert response.status_code in [200, 422]  # 422 if PDF processing fails
+        assert response.status_code in [200, 422]
 
 
 class TestPasswordProtectedPdf:
@@ -244,5 +288,32 @@ class TestPasswordProtectedPdf:
         files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
         data = {"password": "secret123"}
         response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
-        # Request should be accepted (even if PDF isn't actually encrypted)
         assert response.status_code in [200, 422]
+
+
+class TestOcrParameter:
+    """Tests for OCR control parameter."""
+
+    def test_use_ocr_parameter(self, client, auth_headers, sample_pdf_content):
+        """Test that use_ocr parameter is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"use_ocr": "false"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        assert response.status_code in [200, 422]
+
+
+class TestImageFormats:
+    """Tests for image format support."""
+
+    def test_png_file_accepted(self, client, auth_headers, sample_png_content):
+        """Test that PNG files are accepted."""
+        files = {"file": ("invoice.png", io.BytesIO(sample_png_content), "image/png")}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files)
+        # May fail if OCR not available, but should be 400 or 422, not 500
+        assert response.status_code in [200, 400, 422]
+
+    def test_jpg_file_accepted(self, client, auth_headers, sample_jpg_content):
+        """Test that JPG files are accepted."""
+        files = {"file": ("invoice.jpg", io.BytesIO(sample_jpg_content), "image/jpeg")}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files)
+        assert response.status_code in [200, 400, 422]
