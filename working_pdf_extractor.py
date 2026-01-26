@@ -8,10 +8,11 @@ import io
 import logging
 import os
 import re
+import secrets
+import threading
 import time
 import uuid
 from collections import defaultdict
-from functools import lru_cache
 from typing import Optional
 
 import pypdf
@@ -91,44 +92,70 @@ DOLLAR_PATTERN = re.compile(r'\$\s*([\d,]+(?:\.\d{2})?)')
 # =============================================================================
 
 class RateLimiter:
-    """Simple in-memory rate limiter using sliding window."""
+    """
+    Thread-safe in-memory rate limiter using sliding window.
+
+    Note: When running with multiple workers (processes), each worker maintains
+    its own rate limit state. For distributed rate limiting, use Redis or similar.
+    """
 
     def __init__(self, max_requests: int, window_seconds: int):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.requests: dict[str, list[float]] = defaultdict(list)
+        self._lock = threading.Lock()
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 300  # Clean up stale entries every 5 minutes
+
+    def _cleanup_stale_entries(self, now: float) -> None:
+        """Remove entries for clients with no recent requests."""
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+
+        window_start = now - self.window_seconds
+        stale_clients = [
+            client_id for client_id, timestamps in self.requests.items()
+            if not timestamps or max(timestamps) < window_start
+        ]
+        for client_id in stale_clients:
+            del self.requests[client_id]
+        self._last_cleanup = now
 
     def is_allowed(self, client_id: str) -> tuple[bool, dict]:
         """Check if request is allowed and return rate limit info."""
         now = time.time()
         window_start = now - self.window_seconds
 
-        # Clean old requests outside the window
-        self.requests[client_id] = [
-            ts for ts in self.requests[client_id] if ts > window_start
-        ]
+        with self._lock:
+            # Periodic cleanup of stale entries
+            self._cleanup_stale_entries(now)
 
-        current_count = len(self.requests[client_id])
-        remaining = max(0, self.max_requests - current_count)
+            # Clean old requests outside the window for this client
+            self.requests[client_id] = [
+                ts for ts in self.requests[client_id] if ts > window_start
+            ]
 
-        if current_count >= self.max_requests:
-            # Calculate reset time
-            oldest_in_window = min(self.requests[client_id]) if self.requests[client_id] else now
-            reset_time = int(oldest_in_window + self.window_seconds)
-            return False, {
+            current_count = len(self.requests[client_id])
+            remaining = max(0, self.max_requests - current_count)
+
+            if current_count >= self.max_requests:
+                # Calculate reset time
+                oldest_in_window = min(self.requests[client_id]) if self.requests[client_id] else now
+                reset_time = int(oldest_in_window + self.window_seconds)
+                return False, {
+                    "X-RateLimit-Limit": str(self.max_requests),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(reset_time),
+                }
+
+            # Record this request
+            self.requests[client_id].append(now)
+
+            return True, {
                 "X-RateLimit-Limit": str(self.max_requests),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(reset_time),
+                "X-RateLimit-Remaining": str(remaining - 1),
+                "X-RateLimit-Reset": str(int(now + self.window_seconds)),
             }
-
-        # Record this request
-        self.requests[client_id].append(now)
-
-        return True, {
-            "X-RateLimit-Limit": str(self.max_requests),
-            "X-RateLimit-Remaining": str(remaining - 1),
-            "X-RateLimit-Reset": str(int(now + self.window_seconds)),
-        }
 
 rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 
@@ -137,12 +164,18 @@ rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 # =============================================================================
 
 class ResponseCache:
-    """Simple in-memory cache with TTL for API responses."""
+    """
+    Thread-safe in-memory cache with TTL for API responses.
+
+    Note: When running with multiple workers (processes), each worker maintains
+    its own cache. For shared caching, use Redis or similar.
+    """
 
     def __init__(self, max_size: int, ttl_seconds: int):
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
         self.cache: dict[str, tuple[float, dict]] = {}
+        self._lock = threading.Lock()
 
     def _generate_key(self, content: bytes) -> str:
         """Generate cache key from file content hash."""
@@ -151,38 +184,41 @@ class ResponseCache:
     def get(self, content: bytes) -> Optional[dict]:
         """Get cached response if exists and not expired."""
         key = self._generate_key(content)
-        if key in self.cache:
-            timestamp, data = self.cache[key]
-            if time.time() - timestamp < self.ttl_seconds:
-                return data
-            else:
-                # Expired, remove it
-                del self.cache[key]
+        with self._lock:
+            if key in self.cache:
+                timestamp, data = self.cache[key]
+                if time.time() - timestamp < self.ttl_seconds:
+                    return data.copy()  # Return copy to prevent mutation
+                else:
+                    # Expired, remove it
+                    del self.cache[key]
         return None
 
     def set(self, content: bytes, data: dict) -> None:
         """Cache a response."""
-        # Evict oldest entries if at capacity
-        if len(self.cache) >= self.max_size:
-            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][0])
-            del self.cache[oldest_key]
-
         key = self._generate_key(content)
-        self.cache[key] = (time.time(), data)
+        with self._lock:
+            # Evict oldest entries if at capacity
+            if len(self.cache) >= self.max_size:
+                oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][0])
+                del self.cache[oldest_key]
+
+            self.cache[key] = (time.time(), data.copy())  # Store copy
 
     def stats(self) -> dict:
         """Return cache statistics."""
         now = time.time()
-        valid_entries = sum(
-            1 for ts, _ in self.cache.values()
-            if now - ts < self.ttl_seconds
-        )
-        return {
-            "total_entries": len(self.cache),
-            "valid_entries": valid_entries,
-            "max_size": self.max_size,
-            "ttl_seconds": self.ttl_seconds,
-        }
+        with self._lock:
+            valid_entries = sum(
+                1 for ts, _ in self.cache.values()
+                if now - ts < self.ttl_seconds
+            )
+            return {
+                "total_entries": len(self.cache),
+                "valid_entries": valid_entries,
+                "max_size": self.max_size,
+                "ttl_seconds": self.ttl_seconds,
+            }
 
 response_cache = ResponseCache(CACHE_MAX_SIZE, CACHE_TTL)
 
@@ -191,7 +227,12 @@ response_cache = ResponseCache(CACHE_MAX_SIZE, CACHE_TTL)
 # =============================================================================
 
 class MetricsCollector:
-    """Simple metrics collector for monitoring."""
+    """
+    Thread-safe metrics collector for monitoring.
+
+    Note: When running with multiple workers (processes), each worker maintains
+    its own metrics. For aggregated metrics, use Prometheus or similar.
+    """
 
     def __init__(self):
         self.start_time = time.time()
@@ -203,45 +244,50 @@ class MetricsCollector:
         self.total_processing_time = 0.0
         self.rate_limited_requests = 0
         self.auth_failures = 0
+        self._lock = threading.Lock()
 
     def record_request(self, success: bool, processing_time: float, cache_hit: bool = False):
-        self.total_requests += 1
-        self.total_processing_time += processing_time
-        if success:
-            self.successful_requests += 1
-        else:
-            self.failed_requests += 1
-        if cache_hit:
-            self.cache_hits += 1
-        else:
-            self.cache_misses += 1
+        with self._lock:
+            self.total_requests += 1
+            self.total_processing_time += processing_time
+            if success:
+                self.successful_requests += 1
+            else:
+                self.failed_requests += 1
+            if cache_hit:
+                self.cache_hits += 1
+            else:
+                self.cache_misses += 1
 
     def record_rate_limit(self):
-        self.rate_limited_requests += 1
+        with self._lock:
+            self.rate_limited_requests += 1
 
     def record_auth_failure(self):
-        self.auth_failures += 1
+        with self._lock:
+            self.auth_failures += 1
 
     def get_metrics(self) -> dict:
-        uptime = time.time() - self.start_time
-        avg_processing_time = (
-            self.total_processing_time / self.total_requests
-            if self.total_requests > 0 else 0
-        )
-        return {
-            "uptime_seconds": round(uptime, 2),
-            "total_requests": self.total_requests,
-            "successful_requests": self.successful_requests,
-            "failed_requests": self.failed_requests,
-            "cache_hits": self.cache_hits,
-            "cache_misses": self.cache_misses,
-            "cache_hit_rate": round(
-                self.cache_hits / max(1, self.cache_hits + self.cache_misses) * 100, 2
-            ),
-            "avg_processing_time_ms": round(avg_processing_time * 1000, 2),
-            "rate_limited_requests": self.rate_limited_requests,
-            "auth_failures": self.auth_failures,
-        }
+        with self._lock:
+            uptime = time.time() - self.start_time
+            avg_processing_time = (
+                self.total_processing_time / self.total_requests
+                if self.total_requests > 0 else 0
+            )
+            return {
+                "uptime_seconds": round(uptime, 2),
+                "total_requests": self.total_requests,
+                "successful_requests": self.successful_requests,
+                "failed_requests": self.failed_requests,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "cache_hit_rate": round(
+                    self.cache_hits / max(1, self.cache_hits + self.cache_misses) * 100, 2
+                ),
+                "avg_processing_time_ms": round(avg_processing_time * 1000, 2),
+                "rate_limited_requests": self.rate_limited_requests,
+                "auth_failures": self.auth_failures,
+            }
 
 metrics = MetricsCollector()
 
@@ -307,11 +353,19 @@ async def verify_api_key(request: Request):
         return True
 
     provided_key = request.headers.get("X-API-Key")
-    if not provided_key or provided_key != API_KEY:
+    if not provided_key:
         metrics.record_auth_failure()
         raise HTTPException(
             status_code=401,
-            detail="Invalid or missing API key. Provide valid key in X-API-Key header."
+            detail="Missing API key. Provide key in X-API-Key header."
+        )
+
+    # Use constant-time comparison to prevent timing attacks
+    if not secrets.compare_digest(provided_key.encode(), API_KEY.encode()):
+        metrics.record_auth_failure()
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key."
         )
     return True
 
