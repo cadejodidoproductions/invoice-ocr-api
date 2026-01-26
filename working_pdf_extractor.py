@@ -3,16 +3,19 @@ Invoice OCR API - PDF Data Extraction Service
 Performance-optimized with authentication, rate limiting, and caching.
 """
 
+import asyncio
 import hashlib
 import io
 import logging
 import os
 import re
 import secrets
+import signal
 import threading
 import time
 import uuid
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import pypdf
@@ -41,6 +44,12 @@ CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "100"))
 # CORS configuration
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
+# Request timeout (seconds)
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+
+# Batch processing limit
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "10"))
+
 # =============================================================================
 # LOGGING CONFIGURATION
 # =============================================================================
@@ -51,6 +60,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+
 # Custom adapter to include request_id in logs
 class RequestIdAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
@@ -58,38 +68,75 @@ class RequestIdAdapter(logging.LoggerAdapter):
         kwargs["extra"] = {"request_id": request_id}
         return msg, kwargs
 
+
 logger = logging.getLogger("invoice_ocr")
+
+# =============================================================================
+# PDF MAGIC BYTES VALIDATION
+# =============================================================================
+
+# PDF files start with these magic bytes
+PDF_MAGIC_BYTES = b"%PDF"
+
+
+def validate_pdf_magic_bytes(content: bytes) -> bool:
+    """Validate that file content starts with PDF magic bytes."""
+    return content[:4] == PDF_MAGIC_BYTES
+
 
 # =============================================================================
 # PRE-COMPILED REGEX PATTERNS (Performance optimization)
 # =============================================================================
 
 # Invoice number patterns - compiled once at module load
-INVOICE_PATTERN = re.compile(
-    r'(?:Invoice|Inv|INV|Bill|Receipt)\s*[#:.\-]?\s*([A-Z0-9\-]+)',
-    re.IGNORECASE
-)
+INVOICE_PATTERNS = [
+    re.compile(r'(?:Invoice|Inv|INV)\s*[#:.\-]?\s*([A-Z0-9\-]+)', re.IGNORECASE),
+    re.compile(r'(?:Bill|Receipt)\s*[#:.\-]?\s*([A-Z0-9\-]+)', re.IGNORECASE),
+    re.compile(r'(?:Order)\s*[#:.\-]?\s*([A-Z0-9\-]+)', re.IGNORECASE),
+    re.compile(r'#\s*([A-Z0-9\-]{4,})', re.IGNORECASE),  # Generic # followed by ID
+]
 
 # Date patterns - multiple formats supported
 DATE_PATTERNS = [
     # Month name formats: Jan 15, 2024 or January 15, 2024
-    re.compile(
+    (re.compile(
         r'((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
         r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
         r'\s+\d{1,2},?\s+\d{4})',
         re.IGNORECASE
-    ),
-    # Numeric formats: 01/15/2024, 01-15-2024, 2024-01-15
-    re.compile(r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})'),
-    re.compile(r'(\d{4}[/\-]\d{1,2}[/\-]\d{1,2})'),
+    ), 0.95),
+    # ISO format: 2024-01-15
+    (re.compile(r'(\d{4}-\d{2}-\d{2})'), 0.90),
+    # US format: 01/15/2024 or 01-15-2024
+    (re.compile(r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})'), 0.85),
+    # European format with dots: 15.01.2024
+    (re.compile(r'(\d{1,2}\.\d{1,2}\.\d{4})'), 0.80),
 ]
 
-# Dollar amount pattern
-DOLLAR_PATTERN = re.compile(r'\$\s*([\d,]+(?:\.\d{2})?)')
+# Currency patterns - multi-currency support
+CURRENCY_PATTERNS = [
+    # USD
+    (re.compile(r'\$\s*([\d,]+(?:\.\d{2})?)'), "USD", "$"),
+    # EUR
+    (re.compile(r'€\s*([\d,]+(?:[.,]\d{2})?)'), "EUR", "€"),
+    (re.compile(r'EUR\s*([\d,]+(?:[.,]\d{2})?)'), "EUR", "EUR"),
+    # GBP
+    (re.compile(r'£\s*([\d,]+(?:\.\d{2})?)'), "GBP", "£"),
+    (re.compile(r'GBP\s*([\d,]+(?:\.\d{2})?)'), "GBP", "GBP"),
+    # Generic amount (fallback)
+    (re.compile(r'(?:Total|Amount|Due|Balance)[:\s]+\$?([\d,]+(?:\.\d{2})?)'), "USD", "$"),
+]
+
+# Vendor/company patterns
+VENDOR_PATTERNS = [
+    re.compile(r'(?:From|Vendor|Seller|Company|Bill\s*From)[:\s]+([^\n]+)', re.IGNORECASE),
+    re.compile(r'^([A-Z][A-Za-z0-9\s&.,]+(?:Inc|LLC|Ltd|Corp|Co|Company)?\.?)[\s\n]', re.MULTILINE),
+]
 
 # =============================================================================
 # IN-MEMORY RATE LIMITER
 # =============================================================================
+
 
 class RateLimiter:
     """
@@ -114,7 +161,8 @@ class RateLimiter:
 
         window_start = now - self.window_seconds
         stale_clients = [
-            client_id for client_id, timestamps in self.requests.items()
+            client_id
+            for client_id, timestamps in self.requests.items()
             if not timestamps or max(timestamps) < window_start
         ]
         for client_id in stale_clients:
@@ -140,7 +188,9 @@ class RateLimiter:
 
             if current_count >= self.max_requests:
                 # Calculate reset time
-                oldest_in_window = min(self.requests[client_id]) if self.requests[client_id] else now
+                oldest_in_window = (
+                    min(self.requests[client_id]) if self.requests[client_id] else now
+                )
                 reset_time = int(oldest_in_window + self.window_seconds)
                 return False, {
                     "X-RateLimit-Limit": str(self.max_requests),
@@ -157,11 +207,13 @@ class RateLimiter:
                 "X-RateLimit-Reset": str(int(now + self.window_seconds)),
             }
 
+
 rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 
 # =============================================================================
 # RESPONSE CACHE
 # =============================================================================
+
 
 class ResponseCache:
     """
@@ -210,8 +262,7 @@ class ResponseCache:
         now = time.time()
         with self._lock:
             valid_entries = sum(
-                1 for ts, _ in self.cache.values()
-                if now - ts < self.ttl_seconds
+                1 for ts, _ in self.cache.values() if now - ts < self.ttl_seconds
             )
             return {
                 "total_entries": len(self.cache),
@@ -220,11 +271,13 @@ class ResponseCache:
                 "ttl_seconds": self.ttl_seconds,
             }
 
+
 response_cache = ResponseCache(CACHE_MAX_SIZE, CACHE_TTL)
 
 # =============================================================================
 # METRICS COLLECTOR
 # =============================================================================
+
 
 class MetricsCollector:
     """
@@ -244,9 +297,13 @@ class MetricsCollector:
         self.total_processing_time = 0.0
         self.rate_limited_requests = 0
         self.auth_failures = 0
+        self.timeout_errors = 0
+        self.batch_requests = 0
         self._lock = threading.Lock()
 
-    def record_request(self, success: bool, processing_time: float, cache_hit: bool = False):
+    def record_request(
+        self, success: bool, processing_time: float, cache_hit: bool = False
+    ):
         with self._lock:
             self.total_requests += 1
             self.total_processing_time += processing_time
@@ -267,12 +324,21 @@ class MetricsCollector:
         with self._lock:
             self.auth_failures += 1
 
+    def record_timeout(self):
+        with self._lock:
+            self.timeout_errors += 1
+
+    def record_batch_request(self):
+        with self._lock:
+            self.batch_requests += 1
+
     def get_metrics(self) -> dict:
         with self._lock:
             uptime = time.time() - self.start_time
             avg_processing_time = (
                 self.total_processing_time / self.total_requests
-                if self.total_requests > 0 else 0
+                if self.total_requests > 0
+                else 0
             )
             return {
                 "uptime_seconds": round(uptime, 2),
@@ -282,14 +348,50 @@ class MetricsCollector:
                 "cache_hits": self.cache_hits,
                 "cache_misses": self.cache_misses,
                 "cache_hit_rate": round(
-                    self.cache_hits / max(1, self.cache_hits + self.cache_misses) * 100, 2
+                    self.cache_hits / max(1, self.cache_hits + self.cache_misses) * 100,
+                    2,
                 ),
                 "avg_processing_time_ms": round(avg_processing_time * 1000, 2),
                 "rate_limited_requests": self.rate_limited_requests,
                 "auth_failures": self.auth_failures,
+                "timeout_errors": self.timeout_errors,
+                "batch_requests": self.batch_requests,
             }
 
+
 metrics = MetricsCollector()
+
+# =============================================================================
+# GRACEFUL SHUTDOWN
+# =============================================================================
+
+shutdown_event = asyncio.Event()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle application lifespan events for graceful shutdown."""
+    # Startup
+    logger.info("Invoice OCR API starting up...")
+
+    # Setup signal handlers for graceful shutdown
+    loop = asyncio.get_event_loop()
+
+    def handle_shutdown(sig):
+        logger.info(f"Received signal {sig}, initiating graceful shutdown...")
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, handle_shutdown, sig)
+
+    yield
+
+    # Shutdown
+    logger.info("Invoice OCR API shutting down...")
+    # Allow in-flight requests to complete (max 10 seconds)
+    await asyncio.sleep(0.5)
+    logger.info("Shutdown complete")
+
 
 # =============================================================================
 # FASTAPI APPLICATION
@@ -298,7 +400,8 @@ metrics = MetricsCollector()
 app = FastAPI(
     title="Invoice OCR API",
     description="Extract structured data from PDF invoices",
-    version="2.0.0",
+    version="2.1.0",
+    lifespan=lifespan,
 )
 
 # Add CORS middleware
@@ -308,12 +411,18 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
+    expose_headers=[
+        "X-Request-ID",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+    ],
 )
 
 # =============================================================================
 # MIDDLEWARE & DEPENDENCIES
 # =============================================================================
+
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
@@ -356,17 +465,13 @@ async def verify_api_key(request: Request):
     if not provided_key:
         metrics.record_auth_failure()
         raise HTTPException(
-            status_code=401,
-            detail="Missing API key. Provide key in X-API-Key header."
+            status_code=401, detail="Missing API key. Provide key in X-API-Key header."
         )
 
     # Use constant-time comparison to prevent timing attacks
     if not secrets.compare_digest(provided_key.encode(), API_KEY.encode()):
         metrics.record_auth_failure()
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API key."
-        )
+        raise HTTPException(status_code=401, detail="Invalid API key.")
     return True
 
 
@@ -383,63 +488,211 @@ async def check_rate_limit(request: Request):
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded. Maximum {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds.",
-            headers=headers
+            headers=headers,
         )
     return True
+
 
 # =============================================================================
 # PDF EXTRACTION LOGIC
 # =============================================================================
 
-def extract_invoice_data(full_text: str, log: RequestIdAdapter) -> dict:
-    """Extract structured data from PDF text using pre-compiled patterns."""
 
-    # Extract vendor (first non-empty line)
-    lines = [line.strip() for line in full_text.strip().split('\n') if line.strip()]
-    vendor = lines[0] if lines else "Unknown"
-    log.info(f"Extracted vendor: {vendor[:50]}")
+def calculate_confidence(value: str, pattern_confidence: float, text: str) -> float:
+    """Calculate confidence score for an extracted value."""
+    if not value or value in ("N/A", "Unknown", "No date found"):
+        return 0.0
+
+    # Base confidence from pattern
+    confidence = pattern_confidence
+
+    # Boost if value appears multiple times
+    occurrences = text.lower().count(value.lower())
+    if occurrences > 1:
+        confidence = min(1.0, confidence + 0.05 * (occurrences - 1))
+
+    return round(confidence, 2)
+
+
+def extract_vendor(full_text: str) -> tuple[str, float]:
+    """Extract vendor name with confidence score."""
+    # Try specific patterns first
+    for pattern in VENDOR_PATTERNS:
+        match = pattern.search(full_text)
+        if match:
+            vendor = match.group(1).strip()
+            if len(vendor) > 2 and len(vendor) < 100:
+                return vendor, 0.85
+
+    # Fallback to first non-empty line
+    lines = [
+        line.strip() for line in full_text.strip().split("\n") if line.strip()
+    ]
+    if lines:
+        # Skip lines that look like dates or amounts
+        for line in lines[:5]:
+            if not re.match(r'^[\d/$€£]', line) and len(line) > 2:
+                return line[:100], 0.60
+
+    return "Unknown", 0.0
+
+
+def extract_invoice_number(full_text: str) -> tuple[str, float]:
+    """Extract invoice number with confidence score."""
+    for pattern in INVOICE_PATTERNS:
+        match = pattern.search(full_text)
+        if match:
+            invoice_no = match.group(1).strip()
+            if len(invoice_no) >= 2:
+                # Higher confidence for longer, more specific matches
+                confidence = 0.80 if len(invoice_no) >= 4 else 0.65
+                return invoice_no, confidence
+
+    return "N/A", 0.0
+
+
+def extract_date(full_text: str) -> tuple[str, float]:
+    """Extract date with confidence score."""
+    for pattern, confidence in DATE_PATTERNS:
+        match = pattern.search(full_text)
+        if match:
+            return match.group(1), confidence
+
+    return "No date found", 0.0
+
+
+def extract_amounts(full_text: str) -> tuple[list[dict], str, float]:
+    """Extract all monetary amounts with currency detection."""
+    all_amounts = []
+    detected_currency = "USD"
+    currency_symbol = "$"
+
+    for pattern, currency, symbol in CURRENCY_PATTERNS:
+        matches = pattern.findall(full_text)
+        if matches:
+            detected_currency = currency
+            currency_symbol = symbol
+            for match in matches:
+                try:
+                    # Handle European number format (1.234,56)
+                    cleaned = match.replace(" ", "")
+                    if "," in cleaned and "." in cleaned:
+                        # Determine format by position
+                        if cleaned.rfind(",") > cleaned.rfind("."):
+                            # European: 1.234,56
+                            cleaned = cleaned.replace(".", "").replace(",", ".")
+                        else:
+                            # US: 1,234.56
+                            cleaned = cleaned.replace(",", "")
+                    else:
+                        cleaned = cleaned.replace(",", "")
+
+                    val = float(cleaned)
+                    if val > 0:
+                        all_amounts.append(
+                            {"amount": val, "currency": currency, "symbol": symbol}
+                        )
+                except ValueError:
+                    pass
+            break  # Use first matching currency
+
+    # Calculate total confidence based on amounts found
+    confidence = 0.0
+    if all_amounts:
+        confidence = min(0.95, 0.70 + 0.05 * len(all_amounts))
+
+    return all_amounts, detected_currency, confidence
+
+
+def extract_invoice_data(full_text: str, log: RequestIdAdapter) -> dict:
+    """Extract structured data from PDF text with confidence scores."""
+
+    # Extract vendor
+    vendor, vendor_confidence = extract_vendor(full_text)
+    log.info(f"Extracted vendor: {vendor[:50]} (confidence: {vendor_confidence})")
 
     # Extract invoice number
-    invoice_match = INVOICE_PATTERN.search(full_text)
-    invoice_no = invoice_match.group(1) if invoice_match else "N/A"
-    log.info(f"Extracted invoice number: {invoice_no}")
+    invoice_no, invoice_confidence = extract_invoice_number(full_text)
+    log.info(
+        f"Extracted invoice number: {invoice_no} (confidence: {invoice_confidence})"
+    )
 
-    # Extract date (try multiple patterns)
-    date = "No date found"
-    for pattern in DATE_PATTERNS:
-        date_match = pattern.search(full_text)
-        if date_match:
-            date = date_match.group(1)
-            break
-    log.info(f"Extracted date: {date}")
+    # Extract date
+    date, date_confidence = extract_date(full_text)
+    log.info(f"Extracted date: {date} (confidence: {date_confidence})")
 
-    # Extract dollar amounts
-    dollar_amounts = DOLLAR_PATTERN.findall(full_text)
-    log.info(f"Found {len(dollar_amounts)} dollar amounts")
+    # Extract amounts
+    amounts_data, currency, amounts_confidence = extract_amounts(full_text)
+    log.info(
+        f"Found {len(amounts_data)} amounts in {currency} (confidence: {amounts_confidence})"
+    )
 
-    # Convert to floats
-    amounts = []
-    for amt in dollar_amounts:
-        try:
-            val = float(amt.replace(',', ''))
-            amounts.append(val)
-        except ValueError:
-            pass
-
-    # Get the largest amount as total
+    # Get amounts as simple list for backward compatibility
+    amounts = [a["amount"] for a in amounts_data]
     total = max(amounts) if amounts else 0.0
+
+    # Calculate overall confidence
+    confidences = [vendor_confidence, invoice_confidence, date_confidence, amounts_confidence]
+    valid_confidences = [c for c in confidences if c > 0]
+    overall_confidence = (
+        round(sum(valid_confidences) / len(valid_confidences), 2)
+        if valid_confidences
+        else 0.0
+    )
 
     return {
         "vendor": vendor,
         "invoice_no": invoice_no,
         "date": date,
         "total": total,
+        "currency": currency,
         "all_amounts": amounts,
+        "confidence": {
+            "overall": overall_confidence,
+            "vendor": vendor_confidence,
+            "invoice_no": invoice_confidence,
+            "date": date_confidence,
+            "amounts": amounts_confidence,
+        },
     }
+
+
+async def process_single_pdf(
+    content: bytes, filename: str, log: RequestIdAdapter
+) -> dict:
+    """Process a single PDF file and return extracted data."""
+    # Validate PDF magic bytes
+    if not validate_pdf_magic_bytes(content):
+        raise ValueError("Invalid PDF file: magic bytes not found")
+
+    # Extract text from PDF
+    pdf_file = io.BytesIO(content)
+    pdf_reader = pypdf.PdfReader(pdf_file)
+
+    full_text = ""
+    for page_num, page in enumerate(pdf_reader.pages):
+        page_text = page.extract_text() or ""
+        full_text += page_text
+        log.debug(f"Extracted {len(page_text)} chars from page {page_num + 1}")
+
+    if not full_text.strip():
+        raise ValueError(
+            "Could not extract text from PDF. The file may be scanned/image-based."
+        )
+
+    # Extract invoice data
+    result = extract_invoice_data(full_text, log)
+    result["file_type"] = "PDF"
+    result["pages_processed"] = len(pdf_reader.pages)
+    result["filename"] = filename
+
+    return result
+
 
 # =============================================================================
 # API ENDPOINTS
 # =============================================================================
+
 
 @app.post("/invoice-to-json")
 async def process_invoice(
@@ -453,37 +706,52 @@ async def process_invoice(
 
     - **file**: PDF file to process (max 10MB)
 
-    Returns extracted invoice data including vendor, invoice number, date, and amounts.
+    Returns extracted invoice data including vendor, invoice number, date, amounts,
+    currency, and confidence scores.
     """
     start_time = time.time()
     log = get_logger(request)
     cache_hit = False
 
     try:
-        # Read file content
-        content = await file.read()
-        filename = file.filename.lower() if file.filename else ""
+        # Read file content with timeout
+        try:
+            content = await asyncio.wait_for(
+                file.read(), timeout=REQUEST_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            metrics.record_timeout()
+            raise HTTPException(
+                status_code=408, detail=f"Request timeout after {REQUEST_TIMEOUT}s"
+            )
 
+        filename = file.filename.lower() if file.filename else ""
         log.info(f"Processing file: {filename} ({len(content)} bytes)")
 
         # Validate file size
         if len(content) > MAX_FILE_SIZE:
-            log.warning(f"File too large: {len(content)} bytes (max: {MAX_FILE_SIZE})")
+            log.warning(
+                f"File too large: {len(content)} bytes (max: {MAX_FILE_SIZE})"
+            )
             raise HTTPException(
                 status_code=413,
-                detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB."
+                detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.",
             )
 
-        # Validate file type
-        if not filename.endswith('.pdf'):
-            log.warning(f"Unsupported file type: {filename}")
-            return JSONResponse(
-                content={
-                    "error": "Only PDF files are supported",
-                    "file_type": "Unsupported",
-                    "hint": "Please upload a .pdf file"
-                },
-                status_code=400
+        # Validate file extension
+        if not filename.endswith(".pdf"):
+            log.warning(f"Unsupported file extension: {filename}")
+            raise HTTPException(
+                status_code=400,
+                detail="Only PDF files are supported. Please upload a .pdf file.",
+            )
+
+        # Validate PDF magic bytes
+        if not validate_pdf_magic_bytes(content):
+            log.warning(f"Invalid PDF magic bytes: {filename}")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid PDF file. File does not appear to be a valid PDF.",
             )
 
         # Check cache first
@@ -492,42 +760,38 @@ async def process_invoice(
             log.info("Cache hit - returning cached result")
             cache_hit = True
             processing_time = time.time() - start_time
-            metrics.record_request(success=True, processing_time=processing_time, cache_hit=True)
+            metrics.record_request(
+                success=True, processing_time=processing_time, cache_hit=True
+            )
 
             response = JSONResponse(content={**cached_result, "cached": True})
             for key, value in request.state.rate_limit_headers.items():
                 response.headers[key] = value
             return response
 
-        # Extract text from PDF
-        log.info("Extracting text from PDF")
-        pdf_file = io.BytesIO(content)
-        pdf_reader = pypdf.PdfReader(pdf_file)
-
-        full_text = ""
-        for page_num, page in enumerate(pdf_reader.pages):
-            page_text = page.extract_text() or ""
-            full_text += page_text
-            log.debug(f"Extracted {len(page_text)} chars from page {page_num + 1}")
-
-        if not full_text.strip():
-            log.warning("No text extracted from PDF")
-            raise HTTPException(
-                status_code=422,
-                detail="Could not extract text from PDF. The file may be scanned/image-based."
+        # Process PDF with timeout
+        try:
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: asyncio.run(process_single_pdf(content, filename, log))
+                ),
+                timeout=REQUEST_TIMEOUT,
             )
-
-        # Extract invoice data
-        result = extract_invoice_data(full_text, log)
-        result["file_type"] = "PDF"
-        result["pages_processed"] = len(pdf_reader.pages)
+        except asyncio.TimeoutError:
+            metrics.record_timeout()
+            raise HTTPException(
+                status_code=408,
+                detail=f"PDF processing timeout after {REQUEST_TIMEOUT}s",
+            )
 
         # Cache the result
         response_cache.set(content, result)
 
         processing_time = time.time() - start_time
         log.info(f"Processing completed in {processing_time*1000:.2f}ms")
-        metrics.record_request(success=True, processing_time=processing_time, cache_hit=False)
+        metrics.record_request(
+            success=True, processing_time=processing_time, cache_hit=False
+        )
 
         response = JSONResponse(content=result)
         for key, value in request.state.rate_limit_headers.items():
@@ -536,11 +800,150 @@ async def process_invoice(
 
     except HTTPException:
         raise
+    except ValueError as e:
+        processing_time = time.time() - start_time
+        log.warning(f"Validation error: {str(e)}")
+        metrics.record_request(
+            success=False, processing_time=processing_time, cache_hit=cache_hit
+        )
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         processing_time = time.time() - start_time
         log.error(f"Error processing invoice: {str(e)}")
-        metrics.record_request(success=False, processing_time=processing_time, cache_hit=cache_hit)
+        metrics.record_request(
+            success=False, processing_time=processing_time, cache_hit=cache_hit
+        )
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+
+
+@app.post("/invoice-to-json/batch")
+async def process_invoice_batch(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    _auth: bool = Depends(verify_api_key),
+    _rate: bool = Depends(check_rate_limit),
+):
+    """
+    Process multiple PDF invoices in a single request.
+
+    - **files**: List of PDF files to process (max 10 files, 10MB each)
+
+    Returns a list of extraction results for each file.
+    """
+    start_time = time.time()
+    log = get_logger(request)
+    metrics.record_batch_request()
+
+    # Validate batch size
+    if len(files) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many files. Maximum batch size is {MAX_BATCH_SIZE}.",
+        )
+
+    if len(files) == 0:
+        raise HTTPException(status_code=400, detail="No files provided.")
+
+    results = []
+
+    for idx, file in enumerate(files):
+        file_start = time.time()
+        filename = file.filename.lower() if file.filename else f"file_{idx}.pdf"
+
+        try:
+            content = await file.read()
+
+            # Validate file size
+            if len(content) > MAX_FILE_SIZE:
+                results.append({
+                    "filename": filename,
+                    "success": False,
+                    "error": f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.",
+                })
+                continue
+
+            # Validate file extension
+            if not filename.endswith(".pdf"):
+                results.append({
+                    "filename": filename,
+                    "success": False,
+                    "error": "Only PDF files are supported.",
+                })
+                continue
+
+            # Validate PDF magic bytes
+            if not validate_pdf_magic_bytes(content):
+                results.append({
+                    "filename": filename,
+                    "success": False,
+                    "error": "Invalid PDF file.",
+                })
+                continue
+
+            # Check cache
+            cached_result = response_cache.get(content)
+            if cached_result:
+                results.append({
+                    "filename": filename,
+                    "success": True,
+                    "cached": True,
+                    "data": cached_result,
+                })
+                continue
+
+            # Process PDF
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda c=content, f=filename: asyncio.run(
+                    process_single_pdf(c, f, log)
+                ),
+            )
+
+            # Cache result
+            response_cache.set(content, result)
+
+            results.append({
+                "filename": filename,
+                "success": True,
+                "cached": False,
+                "data": result,
+            })
+
+            file_time = time.time() - file_start
+            log.info(f"Processed {filename} in {file_time*1000:.2f}ms")
+
+        except Exception as e:
+            log.error(f"Error processing {filename}: {str(e)}")
+            results.append({
+                "filename": filename,
+                "success": False,
+                "error": str(e),
+            })
+
+    processing_time = time.time() - start_time
+    successful = sum(1 for r in results if r.get("success", False))
+    log.info(
+        f"Batch processing completed: {successful}/{len(files)} successful in {processing_time*1000:.2f}ms"
+    )
+
+    metrics.record_request(
+        success=successful == len(files),
+        processing_time=processing_time,
+        cache_hit=False,
+    )
+
+    response_data = {
+        "total": len(files),
+        "successful": successful,
+        "failed": len(files) - successful,
+        "processing_time_ms": round(processing_time * 1000, 2),
+        "results": results,
+    }
+
+    response = JSONResponse(content=response_data)
+    for key, value in request.state.rate_limit_headers.items():
+        response.headers[key] = value
+    return response
 
 
 @app.get("/")
@@ -549,7 +952,7 @@ async def root():
     return {
         "status": "healthy",
         "service": "Invoice OCR API",
-        "version": "2.0.0",
+        "version": "2.1.0",
     }
 
 
@@ -559,17 +962,22 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Invoice OCR API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "features": {
             "authentication": API_KEY is not None,
             "rate_limiting": True,
             "caching": True,
+            "batch_processing": True,
+            "multi_currency": True,
+            "confidence_scores": True,
         },
         "config": {
             "max_file_size_mb": MAX_FILE_SIZE // (1024 * 1024),
             "rate_limit": f"{RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s",
             "cache_ttl_seconds": CACHE_TTL,
-        }
+            "request_timeout_seconds": REQUEST_TIMEOUT,
+            "max_batch_size": MAX_BATCH_SIZE,
+        },
     }
 
 
@@ -589,7 +997,7 @@ async def get_metrics(
             "max_requests": RATE_LIMIT_REQUESTS,
             "window_seconds": RATE_LIMIT_WINDOW,
             "active_clients": len(rate_limiter.requests),
-        }
+        },
     }
 
 

@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  invoice-ocr-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - WORKERS=4
+      - LOG_LEVEL=INFO
+      - REQUEST_TIMEOUT=30
+      - MAX_FILE_SIZE=10485760
+      - RATE_LIMIT_REQUESTS=100
+      - RATE_LIMIT_WINDOW=60
+      - CACHE_TTL=300
+      - CACHE_MAX_SIZE=100
+      - MAX_BATCH_SIZE=10
+      # Uncomment and set to enable API key authentication
+      # - INVOICE_OCR_API_KEY=your-secret-api-key
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+  # Development service with hot reload
+  invoice-ocr-api-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - WORKERS=1
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ./working_pdf_extractor.py:/app/working_pdf_extractor.py:ro
+    command: ["python", "-m", "uvicorn", "working_pdf_extractor:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    profiles:
+      - dev
