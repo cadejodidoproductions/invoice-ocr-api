@@ -1,6 +1,6 @@
 """
 Invoice OCR API - PDF Data Extraction Service
-Version 2.4.0 - Multi-language OCR support.
+Version 2.5.0 - ML-based extraction for improved accuracy.
 """
 
 import asyncio
@@ -53,6 +53,15 @@ try:
     CELERY_AVAILABLE = True
 except ImportError:
     CELERY_AVAILABLE = False
+
+# Optional ML extraction dependencies
+try:
+    import spacy
+    from transformers import pipeline
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    spacy = None
 
 # =============================================================================
 # CONFIGURATION
@@ -120,6 +129,176 @@ def get_ocr_languages() -> list[str]:
     except Exception:
         return list(OCR_SUPPORTED_LANGUAGES.keys())
 CELERY_ENABLED = os.getenv("CELERY_ENABLED", "false").lower() == "true" and CELERY_AVAILABLE
+
+# ML Extraction configuration
+ML_ENABLED = os.getenv("ML_ENABLED", "true").lower() == "true" and ML_AVAILABLE
+ML_MODEL_NAME = os.getenv("ML_MODEL_NAME", "en_core_web_sm")  # spaCy model
+ML_QA_MODEL = os.getenv("ML_QA_MODEL", "deepset/roberta-base-squad2")  # QA model for field extraction
+ML_CONFIDENCE_THRESHOLD = float(os.getenv("ML_CONFIDENCE_THRESHOLD", "0.5"))
+
+# =============================================================================
+# ML EXTRACTION (Machine Learning-based field extraction)
+# =============================================================================
+
+class MLExtractor:
+    """Machine Learning-based invoice field extractor using spaCy NER and transformers."""
+
+    _instance = None
+    _nlp = None
+    _qa_pipeline = None
+    _initialized = False
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def initialize(self):
+        """Lazy initialization of ML models to avoid startup delay."""
+        if self._initialized:
+            return True
+
+        if not ML_AVAILABLE:
+            return False
+
+        try:
+            # Load spaCy model for NER
+            try:
+                self._nlp = spacy.load(ML_MODEL_NAME)
+            except OSError:
+                # Download model if not available
+                import subprocess
+                subprocess.run(["python", "-m", "spacy", "download", ML_MODEL_NAME], check=True)
+                self._nlp = spacy.load(ML_MODEL_NAME)
+
+            # Load QA pipeline for field extraction
+            self._qa_pipeline = pipeline(
+                "question-answering",
+                model=ML_QA_MODEL,
+                tokenizer=ML_QA_MODEL
+            )
+
+            self._initialized = True
+            return True
+        except Exception as e:
+            logging.getLogger("invoice_ocr").warning(f"ML initialization failed: {e}")
+            return False
+
+    def extract_with_ner(self, text: str) -> dict:
+        """Extract entities using spaCy NER."""
+        if not self._nlp:
+            return {}
+
+        doc = self._nlp(text[:100000])  # Limit text length
+
+        entities = {
+            "organizations": [],
+            "dates": [],
+            "money": [],
+            "locations": [],
+        }
+
+        for ent in doc.ents:
+            if ent.label_ == "ORG":
+                entities["organizations"].append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
+            elif ent.label_ == "DATE":
+                entities["dates"].append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
+            elif ent.label_ == "MONEY":
+                entities["money"].append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
+            elif ent.label_ in ("GPE", "LOC"):
+                entities["locations"].append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
+
+        return entities
+
+    def extract_field_with_qa(self, text: str, question: str) -> tuple[str, float]:
+        """Extract a specific field using question-answering."""
+        if not self._qa_pipeline:
+            return None, 0.0
+
+        try:
+            # Truncate text for QA model (most models have 512 token limit)
+            truncated_text = text[:4000]
+            result = self._qa_pipeline(question=question, context=truncated_text)
+
+            if result["score"] >= ML_CONFIDENCE_THRESHOLD:
+                return result["answer"], result["score"]
+            return None, result["score"]
+        except Exception:
+            return None, 0.0
+
+    def extract_invoice_data(self, text: str) -> dict:
+        """Extract invoice data using ML models."""
+        if not self.initialize():
+            return None
+
+        # Extract entities with NER
+        entities = self.extract_with_ner(text)
+
+        # Define questions for field extraction
+        questions = {
+            "vendor": "What is the name of the company or vendor on this invoice?",
+            "invoice_no": "What is the invoice number?",
+            "po_number": "What is the purchase order or PO number?",
+            "date": "What is the invoice date?",
+            "due_date": "What is the payment due date?",
+            "total": "What is the total amount due?",
+        }
+
+        result = {
+            "vendor": None,
+            "vendor_confidence": 0.0,
+            "invoice_no": None,
+            "invoice_no_confidence": 0.0,
+            "po_number": None,
+            "po_number_confidence": 0.0,
+            "date": None,
+            "date_confidence": 0.0,
+            "due_date": None,
+            "due_date_confidence": 0.0,
+            "total": None,
+            "total_confidence": 0.0,
+            "entities": entities,
+        }
+
+        # Use QA model to extract fields
+        for field, question in questions.items():
+            answer, confidence = self.extract_field_with_qa(text, question)
+            if answer:
+                result[field] = answer
+                result[f"{field}_confidence"] = round(confidence, 2)
+
+        # Enhance vendor detection with NER organizations
+        if not result["vendor"] and entities["organizations"]:
+            # Use the first organization found
+            result["vendor"] = entities["organizations"][0]["text"]
+            result["vendor_confidence"] = 0.75
+
+        # Enhance date detection with NER dates
+        if not result["date"] and entities["dates"]:
+            result["date"] = entities["dates"][0]["text"]
+            result["date_confidence"] = 0.70
+
+        # Enhance total detection with NER money
+        if not result["total"] and entities["money"]:
+            # Find the largest money amount
+            amounts = []
+            for m in entities["money"]:
+                try:
+                    # Extract numeric value from money string
+                    amount_str = re.sub(r"[^\d.,]", "", m["text"])
+                    amount_str = amount_str.replace(",", "")
+                    if amount_str:
+                        amounts.append(float(amount_str))
+                except ValueError:
+                    pass
+            if amounts:
+                result["total"] = str(max(amounts))
+                result["total_confidence"] = 0.70
+
+        return result
+
+# Global ML extractor instance
+ml_extractor = MLExtractor() if ML_AVAILABLE else None
 
 # =============================================================================
 # CELERY CONFIGURATION (Async Job Queue)
@@ -583,7 +762,8 @@ def extract_addresses(text: str) -> list[str]:
     return [m.strip() for m in ADDRESS_PATTERN.findall(text)[:3]]
 
 
-def extract_invoice_data(text: str, log: RequestIdAdapter) -> dict:
+def extract_invoice_data(text: str, log: RequestIdAdapter, use_ml: bool = False) -> dict:
+    # Start with regex-based extraction
     vendor, vc = extract_vendor(text)
     inv_no, ic = extract_invoice_number(text)
     po_no, pc = extract_po_number(text)
@@ -593,12 +773,60 @@ def extract_invoice_data(text: str, log: RequestIdAdapter) -> dict:
     items = extract_line_items(text)
     addrs = extract_addresses(text)
 
+    ml_used = False
+    ml_entities = None
+
+    # Enhance with ML extraction if enabled
+    if use_ml and ML_ENABLED and ml_extractor:
+        try:
+            ml_result = ml_extractor.extract_invoice_data(text)
+            if ml_result:
+                ml_used = True
+                ml_entities = ml_result.get("entities")
+                log.info("ML extraction completed, merging results")
+
+                # Use ML result if higher confidence than regex
+                if ml_result.get("vendor") and ml_result.get("vendor_confidence", 0) > vc:
+                    vendor = ml_result["vendor"]
+                    vc = ml_result["vendor_confidence"]
+
+                if ml_result.get("invoice_no") and ml_result.get("invoice_no_confidence", 0) > ic:
+                    inv_no = ml_result["invoice_no"]
+                    ic = ml_result["invoice_no_confidence"]
+
+                if ml_result.get("po_number") and ml_result.get("po_number_confidence", 0) > pc:
+                    po_no = ml_result["po_number"]
+                    pc = ml_result["po_number_confidence"]
+
+                if ml_result.get("date") and ml_result.get("date_confidence", 0) > dc:
+                    date = ml_result["date"]
+                    dc = ml_result["date_confidence"]
+
+                if ml_result.get("due_date") and ml_result.get("due_date_confidence", 0) > duc:
+                    due = ml_result["due_date"]
+                    duc = ml_result["due_date_confidence"]
+
+                # Parse total from ML if regex didn't find it
+                if amounts["total"] is None and ml_result.get("total"):
+                    try:
+                        amounts["total"] = parse_amount(ml_result["total"])
+                    except (ValueError, TypeError):
+                        pass
+
+                # Add addresses from ML entities
+                if ml_entities and ml_entities.get("locations"):
+                    ml_addresses = [loc["text"] for loc in ml_entities["locations"]]
+                    addrs = list(set(addrs + ml_addresses))[:5]
+
+        except Exception as e:
+            log.warning(f"ML extraction failed, using regex only: {e}")
+
     confs = [c for c in [vc, ic, dc] if c > 0]
     overall = round(sum(confs) / len(confs), 2) if confs else 0.0
 
-    log.info(f"Extracted: vendor={vendor[:30]}, inv={inv_no}, total={amounts['total']}, items={len(items)}")
+    log.info(f"Extracted: vendor={vendor[:30]}, inv={inv_no}, total={amounts['total']}, items={len(items)}, ml={ml_used}")
 
-    return {
+    result = {
         "vendor": vendor,
         "invoice_no": inv_no,
         "po_number": po_no,
@@ -614,7 +842,18 @@ def extract_invoice_data(text: str, log: RequestIdAdapter) -> dict:
         "line_items": items,
         "addresses": addrs,
         "confidence": {"overall": overall, "vendor": vc, "invoice_no": ic, "po_number": pc, "date": dc, "due_date": duc},
+        "ml_enhanced": ml_used,
     }
+
+    # Include detected entities if ML was used
+    if ml_entities:
+        result["ml_entities"] = {
+            "organizations": [e["text"] for e in ml_entities.get("organizations", [])],
+            "dates": [e["text"] for e in ml_entities.get("dates", [])],
+            "money": [e["text"] for e in ml_entities.get("money", [])],
+        }
+
+    return result
 
 
 # =============================================================================
@@ -759,7 +998,7 @@ def process_image_file(content: bytes, filename: str, log: RequestIdAdapter, lan
 # =============================================================================
 
 
-def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True, ocr_language: str = None) -> dict:
+def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True, ocr_language: str = None, use_ml: bool = False) -> dict:
     """Process a document (PDF or image) and extract invoice data."""
     valid, file_type, error = validate_file(content, filename)
     if not valid:
@@ -809,7 +1048,13 @@ def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, 
     if not text.strip():
         raise ValueError("No text could be extracted from the document")
 
-    result = extract_invoice_data(text, log)
+    # Extract invoice data with optional ML enhancement
+    ml_enabled = use_ml and ML_ENABLED
+    if ml_enabled:
+        log.info("ML extraction enabled")
+        metrics.inc("ml_extraction")
+
+    result = extract_invoice_data(text, log, use_ml=ml_enabled)
     result["file_type"] = file_type.upper()
     result["pages"] = pages
     result["filename"] = filename
@@ -826,12 +1071,12 @@ def process_document_sync(content: bytes, filename: str, log: RequestIdAdapter, 
     return result
 
 
-async def process_document(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True, ocr_language: str = None) -> dict:
+async def process_document(content: bytes, filename: str, log: RequestIdAdapter, password: Optional[str] = None, use_ocr: bool = True, ocr_language: str = None, use_ml: bool = False) -> dict:
     """Async wrapper for document processing."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None,
-        lambda: process_document_sync(content, filename, log, password, use_ocr, ocr_language)
+        lambda: process_document_sync(content, filename, log, password, use_ocr, ocr_language, use_ml)
     )
 
 
@@ -841,7 +1086,7 @@ async def process_document(content: bytes, filename: str, log: RequestIdAdapter,
 
 if CELERY_ENABLED:
     @celery_app.task(bind=True)
-    def process_document_task(self, content_b64: str, filename: str, password: Optional[str] = None, use_ocr: bool = True, webhook_url: Optional[str] = None, ocr_language: str = None):
+    def process_document_task(self, content_b64: str, filename: str, password: Optional[str] = None, use_ocr: bool = True, webhook_url: Optional[str] = None, ocr_language: str = None, use_ml: bool = False):
         """Celery task for async document processing."""
         import base64
 
@@ -850,7 +1095,7 @@ if CELERY_ENABLED:
 
         try:
             job_store.update(self.request.id, "processing")
-            result = process_document_sync(content, filename, log, password, use_ocr, ocr_language)
+            result = process_document_sync(content, filename, log, password, use_ocr, ocr_language, use_ml)
             job_store.update(self.request.id, "completed", result=result)
 
             # Send webhook if configured
@@ -927,7 +1172,7 @@ shutdown_event = asyncio.Event()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"Starting Invoice OCR API v2.3.0 (OCR={'enabled' if OCR_ENABLED else 'disabled'}, Celery={'enabled' if CELERY_ENABLED else 'disabled'})")
+    logger.info(f"Starting Invoice OCR API v2.5.0 (OCR={'enabled' if OCR_ENABLED else 'disabled'}, ML={'enabled' if ML_ENABLED else 'disabled'}, Celery={'enabled' if CELERY_ENABLED else 'disabled'})")
     yield
     logger.info("Shutting down")
 
@@ -981,12 +1226,13 @@ async def process_invoice(
     webhook_url: Optional[str] = Form(None),
     use_ocr: Optional[bool] = Form(True),
     ocr_lang: Optional[str] = Form(None, description="OCR language code (e.g., eng, spa, fra, deu, jpn, zho)"),
+    use_ml: Optional[bool] = Form(False, description="Enable ML-based extraction for improved accuracy"),
     validate_data: Optional[bool] = Form(True, alias="validate", description="Enable invoice data validation"),
     export: Optional[str] = Query(None, pattern="^(json|csv|xml)$"),
     _a: bool = Depends(auth),
     _r: bool = Depends(rate_limit),
 ):
-    """Extract data from invoice document (PDF, PNG, JPG, TIFF). Supports OCR for scanned documents in 30+ languages."""
+    """Extract data from invoice document (PDF, PNG, JPG, TIFF). Supports OCR for scanned documents in 30+ languages and ML-based extraction."""
     t0 = time.time()
     log = get_log(request)
     metrics.inc("requests")
@@ -1011,7 +1257,7 @@ async def process_invoice(
     if lang not in OCR_SUPPORTED_LANGUAGES and lang != "osd":
         raise HTTPException(400, f"Unsupported OCR language: {lang}. Supported: {', '.join(sorted(OCR_SUPPORTED_LANGUAGES.keys()))}")
 
-    cached = response_cache.get(content) if not password else None
+    cached = response_cache.get(content) if not password and not use_ml else None
     if cached:
         metrics.inc("cache_hit")
         metrics.inc("success")
@@ -1022,7 +1268,7 @@ async def process_invoice(
     metrics.inc("cache_miss")
     try:
         result = await asyncio.wait_for(
-            process_document(content, fn, log, password, use_ocr and OCR_ENABLED, lang),
+            process_document(content, fn, log, password, use_ocr and OCR_ENABLED, lang, use_ml),
             REQUEST_TIMEOUT
         )
     except asyncio.TimeoutError:
@@ -1033,7 +1279,7 @@ async def process_invoice(
         metrics.inc("failed")
         raise HTTPException(422, str(e))
 
-    if not password:
+    if not password and not use_ml:
         response_cache.set(content, result)
 
     metrics.inc("success")
@@ -1052,10 +1298,11 @@ async def process_invoice_async(
     webhook_url: Optional[str] = Form(None),
     use_ocr: Optional[bool] = Form(True),
     ocr_lang: Optional[str] = Form(None, description="OCR language code (e.g., eng, spa, fra, deu, jpn, zho)"),
+    use_ml: Optional[bool] = Form(False, description="Enable ML-based extraction for improved accuracy"),
     _a: bool = Depends(auth),
     _r: bool = Depends(rate_limit),
 ):
-    """Submit invoice for async processing. Returns job ID for status polling. Supports 30+ OCR languages."""
+    """Submit invoice for async processing. Returns job ID for status polling. Supports 30+ OCR languages and ML-based extraction."""
     log = get_log(request)
     metrics.inc("requests")
     metrics.inc("async_job")
@@ -1086,7 +1333,7 @@ async def process_invoice_async(
         import base64
         content_b64 = base64.b64encode(content).decode()
         task = process_document_task.apply_async(
-            args=[content_b64, fn, password, use_ocr and OCR_ENABLED, webhook_url, lang],
+            args=[content_b64, fn, password, use_ocr and OCR_ENABLED, webhook_url, lang, use_ml],
             task_id=job_id,
         )
         job_store.create(job_id)
@@ -1097,7 +1344,7 @@ async def process_invoice_async(
         async def process_bg():
             try:
                 job_store.update(job_id, "processing")
-                result = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED, lang)
+                result = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED, lang, use_ml)
                 job_store.update(job_id, "completed", result=result)
                 metrics.inc("success")
 
@@ -1144,8 +1391,8 @@ def _resp(data: dict, fmt: Optional[str], request: Request, cached: bool) -> Res
 
 
 @app.post("/invoice-to-json/batch")
-async def batch(request: Request, files: list[UploadFile] = File(...), password: Optional[str] = Form(None), use_ocr: Optional[bool] = Form(True), ocr_lang: Optional[str] = Form(None), _a: bool = Depends(auth), _r: bool = Depends(rate_limit)):
-    """Process multiple documents in one request. Supports 30+ OCR languages."""
+async def batch(request: Request, files: list[UploadFile] = File(...), password: Optional[str] = Form(None), use_ocr: Optional[bool] = Form(True), ocr_lang: Optional[str] = Form(None), use_ml: Optional[bool] = Form(False), _a: bool = Depends(auth), _r: bool = Depends(rate_limit)):
+    """Process multiple documents in one request. Supports 30+ OCR languages and ML-based extraction."""
     t0 = time.time()
     log = get_log(request)
     metrics.inc("requests")
@@ -1174,13 +1421,13 @@ async def batch(request: Request, files: list[UploadFile] = File(...), password:
                 results.append({"filename": fn, "success": False, "error": error})
                 continue
 
-            cached = response_cache.get(content) if not password else None
+            cached = response_cache.get(content) if not password and not use_ml else None
             if cached:
                 results.append({"filename": fn, "success": True, "cached": True, "data": cached})
                 continue
 
-            data = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED, lang)
-            if not password:
+            data = await process_document(content, fn, log, password, use_ocr and OCR_ENABLED, lang, use_ml)
+            if not password and not use_ml:
                 response_cache.set(content, data)
             results.append({"filename": fn, "success": True, "cached": False, "data": data})
         except Exception as e:
@@ -1198,13 +1445,13 @@ async def batch(request: Request, files: list[UploadFile] = File(...), password:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "Invoice OCR API", "version": "2.4.0"}
+    return {"status": "healthy", "service": "Invoice OCR API", "version": "2.5.0"}
 
 
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy", "version": "2.4.0",
+        "status": "healthy", "version": "2.5.0",
         "features": {
             "auth": API_KEY is not None,
             "rate_limiting": True,
@@ -1221,6 +1468,7 @@ async def health():
             "async_processing": True,
             "celery": CELERY_ENABLED,
             "validation": True,
+            "ml_extraction": ML_ENABLED,
         },
         "config": {
             "max_file_mb": MAX_FILE_SIZE // 1024 // 1024,
@@ -1229,6 +1477,7 @@ async def health():
             "batch_size": MAX_BATCH_SIZE,
             "ocr_default_language": OCR_DEFAULT_LANGUAGE if OCR_ENABLED else None,
             "ocr_dpi": OCR_DPI if OCR_ENABLED else None,
+            "ml_model": ML_MODEL_NAME if ML_ENABLED else None,
         }
     }
 
@@ -1251,6 +1500,30 @@ async def list_ocr_languages():
     }
 
 
+@app.get("/ml/status")
+async def ml_status():
+    """Get ML extraction status and configuration."""
+    if not ML_AVAILABLE:
+        return {
+            "available": False,
+            "enabled": False,
+            "message": "ML dependencies not installed. Install with: pip install spacy transformers torch",
+        }
+
+    initialized = ml_extractor._initialized if ml_extractor else False
+    return {
+        "available": True,
+        "enabled": ML_ENABLED,
+        "initialized": initialized,
+        "config": {
+            "spacy_model": ML_MODEL_NAME,
+            "qa_model": ML_QA_MODEL,
+            "confidence_threshold": ML_CONFIDENCE_THRESHOLD,
+        },
+        "note": "Set use_ml=true in your request to enable ML-based extraction",
+    }
+
+
 @app.get("/metrics")
 async def metrics_json(_a: bool = Depends(auth)):
     return {"metrics": metrics.get(), "cache": response_cache.stats()}
@@ -1269,6 +1542,7 @@ v1.add_api_route("/jobs/{job_id}", get_job_status, methods=["GET"])
 v1.add_api_route("/health", health, methods=["GET"])
 v1.add_api_route("/metrics", metrics_json, methods=["GET"])
 v1.add_api_route("/ocr/languages", list_ocr_languages, methods=["GET"])
+v1.add_api_route("/ml/status", ml_status, methods=["GET"])
 app.include_router(v1)
 
 if __name__ == "__main__":

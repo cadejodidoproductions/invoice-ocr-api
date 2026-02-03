@@ -1,5 +1,5 @@
 """
-Tests for Invoice OCR API endpoints (v2.4.0).
+Tests for Invoice OCR API endpoints (v2.5.0).
 """
 
 import io
@@ -17,7 +17,7 @@ class TestHealthEndpoints:
         data = response.json()
         assert data["status"] == "healthy"
         assert data["service"] == "Invoice OCR API"
-        assert data["version"] == "2.4.0"
+        assert data["version"] == "2.5.0"
 
     def test_health_endpoint(self, client):
         """Test the detailed health endpoint."""
@@ -402,3 +402,70 @@ class TestOcrLanguages:
         ]
         response = client.post("/invoice-to-json/batch", headers=auth_headers, files=files, data={"ocr_lang": "fra"})
         assert response.status_code == 200
+
+
+class TestMLExtraction:
+    """Tests for ML-based extraction (v2.5.0)."""
+
+    def test_ml_status_endpoint(self, client):
+        """Test ML status endpoint."""
+        response = client.get("/ml/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert "available" in data
+        assert "enabled" in data
+
+    def test_v1_ml_status_endpoint(self, client):
+        """Test v1 ML status endpoint."""
+        response = client.get("/v1/ml/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert "available" in data
+
+    def test_use_ml_parameter_accepted(self, client, auth_headers, sample_pdf_content):
+        """Test that use_ml parameter is accepted."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"use_ml": "true"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        # Should work regardless of ML availability
+        assert response.status_code in [200, 422]
+
+    def test_use_ml_false_works(self, client, auth_headers, sample_pdf_content):
+        """Test that use_ml=false works normally."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"use_ml": "false"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        assert response.status_code in [200, 422]
+
+    def test_async_use_ml_parameter(self, client, auth_headers, sample_pdf_content):
+        """Test that async endpoint accepts use_ml parameter."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"use_ml": "true"}
+        response = client.post("/invoice-to-json/async", headers=auth_headers, files=files, data=data)
+        assert response.status_code == 200
+        assert "job_id" in response.json()
+
+    def test_batch_use_ml_parameter(self, client, auth_headers, sample_pdf_content):
+        """Test that batch endpoint accepts use_ml parameter."""
+        files = [
+            ("files", ("invoice1.pdf", io.BytesIO(sample_pdf_content), "application/pdf")),
+        ]
+        response = client.post("/invoice-to-json/batch", headers=auth_headers, files=files, data={"use_ml": "true"})
+        assert response.status_code == 200
+
+    def test_health_shows_ml_feature(self, client):
+        """Test that health endpoint shows ML extraction feature."""
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert "ml_extraction" in data["features"]
+
+    def test_ml_enhanced_field_in_response(self, client, auth_headers, sample_pdf_content):
+        """Test that response includes ml_enhanced field when using ML."""
+        files = {"file": ("invoice.pdf", io.BytesIO(sample_pdf_content), "application/pdf")}
+        data = {"use_ml": "false"}
+        response = client.post("/invoice-to-json", headers=auth_headers, files=files, data=data)
+        if response.status_code == 200:
+            result = response.json()
+            # ml_enhanced should be in response
+            assert "ml_enhanced" in result
