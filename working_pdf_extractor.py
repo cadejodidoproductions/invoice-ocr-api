@@ -981,7 +981,7 @@ async def process_invoice(
     webhook_url: Optional[str] = Form(None),
     use_ocr: Optional[bool] = Form(True),
     ocr_lang: Optional[str] = Form(None, description="OCR language code (e.g., eng, spa, fra, deu, jpn, zho)"),
-    validate: Optional[bool] = Form(True),
+    validate_data: Optional[bool] = Form(True, alias="validate", description="Enable invoice data validation"),
     export: Optional[str] = Query(None, pattern="^(json|csv|xml)$"),
     _a: bool = Depends(auth),
     _r: bool = Depends(rate_limit),
