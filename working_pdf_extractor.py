@@ -36,7 +36,8 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 # Optional OCR dependencies
 try:
@@ -1544,6 +1545,24 @@ v1.add_api_route("/metrics", metrics_json, methods=["GET"])
 v1.add_api_route("/ocr/languages", list_ocr_languages, methods=["GET"])
 v1.add_api_route("/ml/status", ml_status, methods=["GET"])
 app.include_router(v1)
+
+# =============================================================================
+# GUI - Web Interface
+# =============================================================================
+
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+@app.get("/gui", include_in_schema=False)
+async def gui():
+    """Serve the web GUI for invoice upload."""
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return JSONResponse({"error": "GUI not available"}, status_code=404)
+
+# Mount static files if directory exists
+if os.path.exists(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 if __name__ == "__main__":
     import uvicorn
